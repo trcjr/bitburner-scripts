@@ -29,10 +29,10 @@ let chains;
 let testBoard = [];
 
 const argsSchema = [
-  ['cheats', false], // This is only true if you have BN14
+  ['cheats', false],  // This is only true if you have BN14
   ['logtime', false], // Logs time time it takes for each player to take their move
   ['runOnce', false], // Will only play one game if enabled
-  ['silent', false], // Enabling this stops the window from spawning.
+  ['silent', false],  // Enabling this stops the window from spawning.
 ];
 
 
@@ -1442,9 +1442,9 @@ function getOpeningMove() {
 //* is move here next if you can - no safeties
 
 const disrupt4 = [
-  ["??b?", "?b.b", "b.*b", "?bb?"],  //Pattern# Sphyxis - buy a turn #GREAT
-  ["?bb?", "b..b", "b*Xb", "?bb?"],  //Pattern# Sphyxis - buy a turn #GREAT
-  ["?bb?", "b..b", "b.*b", "?bb?"],  //Pattern# Sphyxis - buy a turn #GREAT
+  ["??b?", "?b.b", "b.*b", "?bb?"], //Pattern# Sphyxis - buy a turn #GREAT
+  ["?bb?", "b..b", "b*Xb", "?bb?"], //Pattern# Sphyxis - buy a turn #GREAT
+  ["?bb?", "b..b", "b.*b", "?bb?"], //Pattern# Sphyxis - buy a turn #GREAT
   ["??b?", "?b.b", "?b*b", "??O?"], //Pattern# Sphyxis - Sacrifice to kill an eye
   ["?bbb", "bb.b", "W.*b", "?oO?"], //Pattern# Sphyxis - 2x2 nook breatk
   ["?bbb", "bb.b", "W.*b", "?Oo?"], //Pattern# Sphyxis - 2x2 nook break
@@ -1452,8 +1452,8 @@ const disrupt4 = [
 ]
 const disrupt5 = [
   ["?bbb?", "b.*.b", "?bbb?", "?????", "?????"], //Pattern# Sphyxis - Convert to 1 eye
-  ["??OO?", "?b*.b", "?b..b", "??bb?", "?????"],  //Pattern# Sphyxis - Buy time
-  ["?????", "??bb?", "?b*Xb", "?boob", "??bb?"],  //Pattern# Sphyxis - Buy time
+  ["??OO?", "?b*.b", "?b..b", "??bb?", "?????"], //Pattern# Sphyxis - Buy time
+  ["?????", "??bb?", "?b*Xb", "?boob", "??bb?"], //Pattern# Sphyxis - Buy time
   ["WWW??", "WWob?", "Wo*b?", "WWW??", "?????"], //Pattern# Sphyxis - 2x2 attack corner if possible
   ["??b??", "?b.b?", "?b*b?", "?b.A?", "??b??"], //Pattern# Sphyxis - Break two eyes into 1, buy a turn
   ["??b??", "?b.b?", "??*.b", "?b?b?", "?????"], //Pattern# Sphyxis - Break eyes, buy time
