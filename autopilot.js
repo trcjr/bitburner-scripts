@@ -1,7 +1,7 @@
 import {
     log, getFilePath, getConfiguration, instanceCount, getNsDataThroughFile, runCommand, waitForProcessToComplete,
     getActiveSourceFiles, tryGetBitNodeMultipliers, getStocksValue, unEscapeArrayArgs,
-    formatMoney, formatDuration
+    formatMoney, formatDuration, getErrorInfo
 } from './helpers.js'
 
 const persistentLog = "log.autopilot.txt";
@@ -48,12 +48,13 @@ let reservedPurchase = 0; // Flag to indicate whether we've reservedPurchase mon
 let reserveForDaedalus = false, daedalusUnavailable = false; // Flags to indicate that we should be keeping 100b cash on hand to earn an invite to Daedalus
 let lastScriptsCheck = 0; // Last time we got a listing of all running scripts
 let killScripts = []; // A list of scripts flagged to be restarted due to changes in priority
-let dictOwnedSourceFiles = [], unlockedSFs = [], bitnodeMults, nextBn = 0; // Info for the current bitnode
+let dictOwnedSourceFiles = [], unlockedSFs = [], nextBn = 0; // Info for the current bitnode
 let installedAugmentations = [], playerInstalledAugCount = 0, stanekLaunched = false; // Info for the current ascend
 let daemonStartTime = 0; // The time we personally launched daemon.
 let installCountdown = 0; // Start of a countdown before we install augmentations.
 let bnCompletionSuppressed = false; // Flag if we've detected that we've won the BN, but are suppressing a restart
 let resetInfo = (/**@returns{ResetInfo}*/() => undefined)(); // Information about the current bitnode
+let bitNodeMults = (/**@returns{BitNodeMultipliers}*/() => undefined)(); // bitNode multipliers that can be automatically determined after SF-5
 
 // Replacements for player properties deprecated since 2.3.0
 function getTimeInAug() { return Date.now() - resetInfo.lastAugReset; }
@@ -81,9 +82,8 @@ export async function main(ns) {
             await mainLoop(ns);
         }
         catch (err) {
-            log(ns, `WARNING: autopilot.js Caught (and suppressed) an unexpected error:\n` +
-                (typeof err === 'string' ? err : err?.stack ? err.stack : JSON.stringify(err)),
-                false, 'warning');
+            log(ns, `WARNING: autopilot.js Caught (and suppressed) an unexpected error:` +
+                `\n${getErrorInfo(err)}`, false, 'warning');
         }
         await ns.sleep(options['interval']);
     }
@@ -104,7 +104,7 @@ async function startUp(ns) {
     // Collect and cache some one-time data
     const player = await getNsDataThroughFile(ns, 'ns.getPlayer()');
     resetInfo = await getNsDataThroughFile(ns, 'ns.getResetInfo()');
-    bitnodeMults = await tryGetBitNodeMultipliers(ns);
+    bitNodeMults = await tryGetBitNodeMultipliers(ns);
     dictOwnedSourceFiles = await getActiveSourceFiles(ns, false);
     unlockedSFs = await getActiveSourceFiles(ns, true);
     try {
@@ -192,10 +192,8 @@ async function checkOnDaedalusStatus(ns, player, stocksValue) {
         return (4 in unlockedSFs) ? await getNsDataThroughFile(ns, 'ns.singularity.joinFaction(ns.args[0])', null, ["Daedalus"]) :
             log(ns, "INFO: Please manually join the faction 'Daedalus' as soon as possible to proceed", false, 'info');
     }
-    const bitNodeMults = await tryGetBitNodeMultipliers(ns, false) || { DaedalusAugsRequirement: 1 };
-    // Note: A change coming soon will convert DaedalusAugsRequirement from a fractional multiplier, to an integer number of augs. This should support both for now.
-    const reqDaedalusAugs = bitNodeMults.DaedalusAugsRequirement < 2 ? Math.round(30 * bitNodeMults.DaedalusAugsRequirement) : bitNodeMults.DaedalusAugsRequirement;
-    if (playerInstalledAugCount !== null && playerInstalledAugCount < reqDaedalusAugs)
+    // See if we have enough augmentations to attempt to join Daedalus
+    if (playerInstalledAugCount !== null && playerInstalledAugCount < bitNodeMults.DaedalusAugsRequirement)
         return daedalusUnavailable = true; // Won't be able to unlock daedalus this ascend
     // If we have sufficient augs and hacking, all we need is the money (100b)
     const totalWorth = player.money + stocksValue;
@@ -433,9 +431,10 @@ async function checkOnRunningScripts(ns, player) {
         launchScriptHelper(ns, 'work-for-factions.js', rushGang ? rushGangsArgs : workForFactionsArgs);
     }
 
+    // Launch go.js
     const goplayer = findScript('go.js');
     if (!options["disable-go"] && !goplayer && homeRam >= 75) {
-        launchScriptHelper(ns, 'go.js', 14 in unlockedSFs && unlockedSFs[14] >= 2 ? ["--cheats"] : []);
+        launchScriptHelper(ns, 'go.js', (14 in unlockedSFs) && (unlockedSFs[14] >= 2) ? ["--cheats"] : []);
     }
 }
 
@@ -597,8 +596,8 @@ async function shouldDelayInstall(ns, player, facmanOutput) {
     if (!options['disable-wait-for-4s'] && !(await getNsDataThroughFile(ns, `ns.stock.has4SDataTIXAPI()`))) {
         const totalWorth = player.money + await getStocksValue(ns);
         const has4S = await getNsDataThroughFile(ns, `ns.stock.has4SData()`);
-        const totalCost = 25E9 * (bitnodeMults?.FourSigmaMarketDataApiCost || 1) +
-            (has4S ? 0 : 1E9 * (bitnodeMults?.FourSigmaMarketDataCost || 1));
+        const totalCost = 25E9 * bitNodeMults.FourSigmaMarketDataApiCost +
+            (has4S ? 0 : 1E9 * bitNodeMults.FourSigmaMarketDataCost);
         const ratio = totalWorth / totalCost;
         // If we're e.g. 50% of the way there, hold off, regardless of the '--wait-for-4s' setting
         // TODO: If ratio is > 1, we can afford it - but stockmaster won't buy until it has e.g. 20% more than the cost
@@ -668,7 +667,7 @@ function launchScriptHelper(ns, baseScriptName, args = [], convertFileName = tru
         log(ns, `INFO: Launched ${baseScriptName} (pid: ${pid}) with args: [${args.join(", ")}]`, true);
     else
         log(ns, `ERROR: Failed to launch ${baseScriptName} with args: [${args.join(", ")}]` +
-            err ? `\nCaught: ` + (typeof err === 'string' ? err : err.message || JSON.stringify(err)) : '', true, 'error');
+            (err ? `\nCaught: ${getErrorInfo(err)}` : ''), true, 'error');
     return pid;
 }
 

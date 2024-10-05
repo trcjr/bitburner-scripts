@@ -1,4 +1,7 @@
-import { log, getConfiguration, getFilePath, waitForProcessToComplete, runCommand, getNsDataThroughFile, autoRetry } from './helpers.js'
+import {
+    log, getConfiguration, getFilePath, waitForProcessToComplete,
+    runCommand, getNsDataThroughFile, getActiveSourceFiles, getErrorInfo
+} from './helpers.js'
 
 const ran_flag = "/Temp/ran-casino.txt"
 let doc = eval("document");
@@ -23,13 +26,6 @@ export function autocomplete(data, args) {
 
 let _ns; // Lazy global copy of ns so we can sleep in the click handler
 
-/** Helper to open a tail window and log a message to the console and terminal. Useful when trying to inform the player of a failure.
- * @param {NS} ns **/
-function tailAndLog(ns, message) {
-    ns.tail();
-    log(ns, message, true);
-}
-
 /** @param {NS} ns **/
 export async function main(ns) {
     options = getConfiguration(ns, argsSchema);
@@ -43,12 +39,33 @@ export async function main(ns) {
 
     // Step 1: Go to Aevum if we aren't already there. (Must be done manually if you don't have SF4)
     if (ns.getPlayer().city != "Aevum") {
-        try {
-            if (ns.getPlayer().money < 200000 || !(await getNsDataThroughFile(ns, 'ns.singularity.travelToCity(ns.args[0])', null, ["Aevum"])))
-                return tailAndLog(ns, "ERROR: Sorry, you need at least 200k to travel to the casino.");
-        } catch (err) {
-            return tailAndLog(ns, "ERROR: You must manually travel to to Aevum to use this script until you get SF4");
+        if (ns.getPlayer().money < 200000)
+            return log(ns, "ERROR: Sorry, you need at least 200k to travel to the casino.", true, 'error');
+        // See if we have SF4 to travel automatically
+        const unlockedSFs = await getActiveSourceFiles(ns, true);
+        let travelled = false;
+        if (4 in unlockedSFs) {
+            try {
+                travelled = await getNsDataThroughFile(ns, 'ns.singularity.travelToCity(ns.args[0])', null, ["Aevum"]);
+            } catch { }
+            if (!travelled)
+                log(ns, "WARN: Failed to travel to Aevum automatically (perhaps RAM / SF4 level is too low?). " +
+                    "We will have to go there manually for now.", true, 'warning');
+        } else
+            log(ns, `INFO: We must "manually" travel to Aevum since we don't have SF4`, true);
+        // If automatic travel failed or couldn't be attempted, try clicking around!
+        if (!travelled) {
+            let travelBtn = await findRetry(ns, "//div[@role='button' and ./div/p/text()='Travel']");
+            if (!travelBtn) return;
+            await click(travelBtn);
+            let cityBtn = await findRetry(ns, "//span[contains(@class,'travel') and ./text()='A']");
+            if (!cityBtn) return;
+            await click(cityBtn);
         }
+        if (ns.getPlayer().city == "Aevum")
+            log(ns, `SUCESS: We're now in Aevum!`)
+        else
+            return log(ns, `ERROR: We thought we travelled to Aevum, but we're apparently still in ${ns.getPlayer().city}...`, true, 'error');
     }
 
     // Helper function to detect if the "Stop [[faction|company] work|styding|training]" etc... button from the focus screen is up
@@ -56,10 +73,25 @@ export async function main(ns) {
         await findRetry(ns, "//button[contains(text(), 'Stop playing')]", true) ? false : // False positive, casino "stop" button, no problems here
             await findRetry(ns, "//button[contains(text(), 'Stop')]", true); // Otherwise, a button with "Stop" on it is probably from the work screen
 
-    // Find the button used to save the game
+    // Helper function to detect getting kicked out of the casino
+    const checkForKickedOut = async () => {
+        let closeModal;
+        do {
+            const kickedOut = await findRetry(ns, "//span[contains(text(), 'Alright cheater get out of here')]", true);
+            if (kickedOut !== null) return kickedOut;
+            // If there are any other modals, they may need to be closed before we can see the kicked out alert.
+            let closeModal = await findRetry(ns, "//button[contains(@class,'closeButton')]", true);
+            if (!closeModal) break;
+            log(ns, "Found a modal that needs to be closed.")
+            await click(closeModal);
+        } while (closeModal !== null);
+    }
+
+    // Find the button used to save the game. (Lots of retries because it can take a while after reloading the page)
     const btnSaveGame = await findRetry(ns, "//button[@aria-label = 'save game']");
     if (!btnSaveGame)
-        return tailAndLog(ns, "ERROR: Sorry, couldn't find the Overview Save (💾) button. Is your \"Overview\" panel collapsed or modded?");
+        return log(ns, `ERROR: Sorry, couldn't find the Overview Save (💾) button. ` +
+            `Is your \"Overview\" panel collapsed or modded?`, true);
     let inputWager, btnStartGame;
 
     // Step 2: Try to navigate to the blackjack game until successful, in case something repeatedly steals focus
@@ -80,13 +112,13 @@ export async function main(ns) {
                 await click(await findRetry(ns, "//span[@aria-label = 'Iker Molina Casino']"));
             } catch { // Use SF4 as a fallback, it's more reliable.
                 try { await getNsDataThroughFile(ns, 'ns.singularity.goToLocation(ns.args[0])', null, ["Iker Molina Casino"]); }
-                catch { return tailAndLog(ns, "ERROR: Failed to travel to the casino both using UI navigation and using SF4 as a fall-back."); }
+                catch { return log(ns, "ERROR: Failed to travel to the casino both using UI navigation and using SF4 as a fall-back.", true); }
             }
             // Step 2.3: Try to start the blackjack game
             const blackjack = await findRetry(ns, "//button[contains(text(), 'blackjack')]");
             if (!blackjack) {
-                tailAndLog(ns, `ERROR: Could not find the "Play blackjack" button. Did something steal focus? Trying again... ` +
-                    `Please post a full-game screenshot on Discord if you can't get past this point.`)
+                log(ns, `ERROR: Could not find the "Play blackjack" button. Did something steal focus? Trying again... ` +
+                    `Please post a full-game screenshot on Discord if you can't get past this point.`, true);
                 continue; // Loop back to start and try again
             }
             await click(blackjack);
@@ -95,8 +127,8 @@ export async function main(ns) {
             inputWager = await findRetry(ns, "//input[@value = 1000000]");
             btnStartGame = await findRetry(ns, "//button[text() = 'Start']");
             if (!inputWager || !btnStartGame) {
-                tailAndLog(ns, `ERROR: Could not find one or more game controls. Did something steal focus? Trying again... ` +
-                    `Please post a full-game screenshot on Discord if you can't get past this point.`)
+                log(ns, `ERROR: Could not find one or more game controls. Did something steal focus? Trying again... ` +
+                    `Please post a full-game screenshot on Discord if you can't get past this point.`, true)
                 continue; // Loop back to start and try again
             }
 
@@ -114,8 +146,9 @@ export async function main(ns) {
                         log(ns, "ERROR: It looks like something stole focus while we were trying to automate the casino. Trying again.");
                         continue; // Loop back to start and try again
                     }
-                    ns.write(ran_flag, "True", "w"); // Write a flag other scripts can check for indicating we think we've been kicked out of the casino.
-                    return log(ns, "INFO: We appear to already have been previously kicked out of the casino.", true);
+                    if (await checkForKickedOut())
+                        return onCompletion(ns);
+                    return log(ns, "ERROR: Couldn't start a game of blackjack at the casino, but we don't appear to be kicked out...", true);
                 }
                 // Step 2.5.2: Kill all other scripts if enabled (note, we assume that if the temp folder is empty, they're already killed and this is a reload)
                 if (options['kill-all-scripts'])
@@ -126,8 +159,8 @@ export async function main(ns) {
             break; // We achieved everthing we wanted, we can exit the while loop.
         } catch (err) {
             ns.tail(); // We're having difficulty, pop open a tail window so the user is aware.
-            log(ns, `WARNING: casino.js Caught (and suppressed) an unexpected error while navigating to blackjack. Will try again...\n` +
-                (typeof err === 'string' ? err : err.message || JSON.stringify(err)), false, 'warning');
+            log(ns, `WARNING: casino.js Caught (and suppressed) an unexpected error while navigating to blackjack. ` +
+                `Will try again...\n${getErrorInfo(err)}`, false, 'warning');
         }
     }
 
@@ -140,38 +173,64 @@ export async function main(ns) {
     if (saveSleepTime) await ns.sleep(saveSleepTime);
 
     // Step 4: Play until we lose
-    while (true) {
-        const bet = Math.min(1E8, ns.getPlayer().money * 0.9 /* Avoid timing issues with other scripts spending money */);
-        if (bet < 0) return await reload(ns); // If somehow we have no money, we can't continue
-        await setText(inputWager, `${bet}`);
-        await click(btnStartGame);
-        const btnHit = await findRetry(ns, "//button[text() = 'Hit']");
-        const btnStay = await findRetry(ns, "//button[text() = 'Stay']");
-        let won;
-        do { // Inner-loop to play a single hand
-            won = await findRetry(ns, "//p[contains(text(), 'lost')]", true) ? false : // Detect whether we lost or won. Annoyingly, when we win with blackjack, "Won" is Title-Case.
-                await findRetry(ns, "//p[contains(text(), 'won')]", true) ||
-                    await findRetry(ns, "//p[contains(text(), 'Won')]", true) ? true : null;
-            if (won === null) {
-                if (await findRetry(ns, "//p[contains(text(), 'Tie')]", true)) break; // If we tied, break and start a new hand.
-                const txtCount = await findRetry(ns, "//p[contains(text(), 'Count:')]", true, 20);
-                if (!txtCount) { // If we can't find the count, we've either been kicked out, or maybe routed to another screen.
-                    return await checkForFocusScreen() /* Detect the case where we started working/training */ ?
-                        log(ns, "ERROR: It looks like something stole focus while we were trying to automate the casino. Please try again.", true) :
-                        onCompletion(ns); // Otherwise, assume we've been kicked out of the casino for having stolen the max 10b
-                }
-                const allCounts = txtCount.querySelectorAll('span');
-                const highCount = Number(allCounts[allCounts.length - 1].innerText);
-                const shouldHit = options['use-basic-strategy'] ? highCount < 17 : shouldHitAdvanced(ns, txtCount);
-                if (options['enable-logging']) log(ns, `INFO: Count is ${highCount}, we will ${shouldHit ? 'Hit' : 'Stay'}`);
-                await click(shouldHit ? btnHit : btnStay);
-                await ns.sleep(1); // Yield for an instant so the UI can update and process events
+    try {
+        let suppressedErrors = 0;
+        while (true) {
+            const bet = Math.min(1E8, ns.getPlayer().money * 0.9 /* Avoid timing issues with other scripts spending money */);
+            if (bet < 0) return await reload(ns); // If somehow we have no money, we can't continue
+            await setText(inputWager, `${bet}`);
+            await click(btnStartGame);
+            // If we can't find these buttons, we've ever been kicked out or didn't managed to "click" start game
+            let btnHit = await findRetry(ns, "//button[text() = 'Hit']", suppressedErrors < 4, 10);
+            let btnStay = await findRetry(ns, "//button[text() = 'Stay']", suppressedErrors < 4, 10);
+            if (!btnHit || !btnStay) {
+                // Detect if we were kicked out (hopefully this is why the buttons are missing)
+                if (await checkForKickedOut())
+                    return onCompletion(ns);
+                // No? Well sometimes "clicking" start game fails. If this is what happened, 
+                // we can suppress the error and start over. If it keeps happening, something else is wrong...
+                suppressedErrors++; // Once this reahes 4, calls to findRetry above will throw an error on failure.
+                // In case we lost our start button (e.g. re-rendered as different element), find it again
+                btnStartGame = await findRetry(ns, "//button[text() = 'Start']");
+                continue;
             }
-        } while (won === null);
-        if (won === null) continue; // Only possible if we tied and broke out early. Start a new hand.
-        if (!won) return await reload(ns); // Reload if we lost
-        await click(btnSaveGame); // Save if we won
-        if (saveSleepTime) await ns.sleep(saveSleepTime);
+            suppressedErrors = 0;
+            let won;
+            do { // Inner-loop to play a single hand
+                won = await findRetry(ns, "//p[contains(text(), 'lost')]", true) ? false : // Detect whether we lost or won. Annoyingly, when we win with blackjack, "Won" is Title-Case.
+                    await findRetry(ns, "//p[contains(text(), 'won')]", true) ||
+                        await findRetry(ns, "//p[contains(text(), 'Won')]", true) ? true : null;
+                if (won === null) {
+                    if (await findRetry(ns, "//p[contains(text(), 'Tie')]", true)) break; // If we tied, break and start a new hand.
+                    const txtCount = await findRetry(ns, "//p[contains(text(), 'Count:')]", true, 10);
+                    if (!txtCount) { // If we can't find the count, we've either been kicked out, or maybe routed to another screen.
+                        if (await checkForKickedOut())
+                            return onCompletion(ns); // Were we kicked out? If so, success!
+                        if (await checkForFocusScreen()) // Did we start working/training?
+                            return log(ns, "ERROR: It looks like something stole focus while we were trying to automate the casino. " +
+                                "Please make sure no other scripts are running and try again.", true);
+                        // Otherwise, it could be a temporary glitch
+                        if (++suppressedErrors < 3)
+                            continue; // Try to loop back and start a new game
+                        log(ns, "ERROR: Could not find expected elements. Did you navigate away from the Casino?", true)
+                    }
+                    const allCounts = txtCount.querySelectorAll('span');
+                    const highCount = Number(allCounts[allCounts.length - 1].innerText);
+                    const shouldHit = options['use-basic-strategy'] ? highCount < 17 : shouldHitAdvanced(ns, txtCount);
+                    if (options['enable-logging']) log(ns, `INFO: Count is ${highCount}, we will ${shouldHit ? 'Hit' : 'Stay'}`);
+                    await click(shouldHit ? btnHit : btnStay);
+                    await ns.sleep(1); // Yield for an instant so the UI can update and process events
+                }
+            } while (won === null);
+            if (won === null) continue; // Only possible if we tied and broke out early. Start a new hand.
+            if (!won) return await reload(ns); // Reload if we lost
+            await click(btnSaveGame); // Save if we won
+            if (saveSleepTime) await ns.sleep(saveSleepTime);
+        }
+    }
+    catch (error) {
+        ns.tail(); // Display the tail log if anything goes wrong 
+        throw error; // Rethrow
     }
 }
 
@@ -236,16 +295,39 @@ async function setText(input, text) {
     await input[Object.keys(input)[1]].onChange({ isTrusted: true, target: { value: text } });
     if (options['click-sleep-time']) await _ns.sleep(options['click-sleep-time']);
 }
+
+/* Used to search for an element in the document. This can fail if the dom isn't fully re-rendered yet. */
 function find(xpath) { return doc.evaluate(xpath, doc, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; }
+
+/* Try to find an element, with retries.
+   This is tricky - in some cases we are just checking if the element exists, but expect that it might not
+   (expectFailure = true) - in this case we want some retries in case we were just too fast to detect the element
+   but we don't want to retry too much. We also don't want to be too noisy if we fail to find the element.
+   In other cases, we always expect to find the element we're looking for, and if we don't it's an error. */
 async function findRetry(ns, xpath, expectFailure = false, retries = null) {
     try {
-        return await autoRetry(ns, () => find(xpath), e => e !== undefined,
-            () => expectFailure ? `It's looking like the element with xpath: ${xpath} isn't present...` :
-                `Could not find the element with xpath: ${xpath}\nSomething may have re-routed the UI`,
-            retries != null ? retries : expectFailure ? 3 : 10, 1, 2);
+        log(ns, `INFO: ${(expectFailure ? "Checking if element is on screen" : "Searching for expected element")}: ${xpath}`, false);
+        const maxRetries = retries != null ? retries : expectFailure ? 4 : 10;
+        let attempts = 0, retryDelayMs = 1;
+        while (attempts++ <= maxRetries) {
+            // Sleep between attempts
+            if (attempts > 1) {
+                await ns.sleep(retryDelayMs);
+                retryDelayMs *= 2;
+            }
+            const findAttempt = find(xpath);
+            if (findAttempt !== null)
+                return findAttempt;
+        }
+        if (expectFailure)
+            log(ns, `INFO: Element doesn't appear to be present, moving on...`, false);
+        else
+            log(ns, `FAIL: Could not find the element with xpath: ${xpath}` +
+                `\nSomething may have re-routed the UI.`, true, 'error');
     } catch (e) {
         if (!expectFailure) throw e;
     }
+    return null;
 }
 
 // Better logic for when to HIT / STAY (Partial credit @drider)
