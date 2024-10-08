@@ -1275,7 +1275,7 @@ async function movePiece(ns, attack) {
     ns.printf("%s", attack.msg)
     const results = await go_makeMove(ns, x, y);
     let END = performance.now()
-    if (LOGTIME) ns.printf("Time: Me: %s  Them: %s", ns.tFormat(mid - START, true), ns.tFormat(END - mid, true))
+    if (logtime) ns.printf("Time: Me: %s  Them: %s", ns.tFormat(mid - START, true), ns.tFormat(END - mid, true))
     START = performance.now()
     return results
 }
