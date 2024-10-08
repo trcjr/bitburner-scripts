@@ -12,7 +12,7 @@ export function formatMoney(num, maxSignificantFigures = 6, maxDecimalPlaces = 3
 const symbols = ["", "k", "m", "b", "t", "q", "Q", "s", "S", "o", "n", "e33", "e36", "e39"];
 
 /**
- * Return a formatted representation of the monetary amount using scale sympols (e.g. 6.50M) 
+ * Return a formatted representation of the monetary amount using scale sympols (e.g. 6.50M)
  * @param {number} num - The number to format
  * @param {number=} maxSignificantFigures - (default: 6) The maximum significant figures you wish to see (e.g. 123, 12.3 and 1.23 all have 3 significant figures)
  * @param {number=} maxDecimalPlaces - (default: 3) The maximum decimal places you wish to see, regardless of significant figures. (e.g. 12.3, 1.2, 0.1 all have 1 decimal)
@@ -123,13 +123,14 @@ export function getFnIsAliveViaNsPs(ns) {
 
 /**
  * Retrieve the result of an ns command by executing it in a temporary .js script, writing the result to a file, then shuting it down
- * Importing incurs a maximum of 1.1 GB RAM (0 GB for ns.read, 1 GB for ns.run, 0.1 GB for ns.isRunning).
+ * Importing incurs 1.0 GB RAM (uses ns.run), but if you are already using ns.exec in your script for other purposes,
+ * you can call getNsDataThroughFile_Custom with fnRun set to the result of `getFnRunViaNsExec(ns)` and incur no additional RAM.
  * Has the capacity to retry if there is a failure (e.g. due to lack of RAM available). Not recommended for performance-critical code.
  * @param {NS} ns The nestcript instance passed to your script's main entry point
- * @param {string} command - The ns command that should be invoked to get the desired data (e.g. "ns.getServer('home')" )
- * @param {string=} fName - (default "/Temp/{command-name}.txt") The name of the file to which data will be written to disk by a temporary process
- * @param {args=} args - args to be passed in as arguments to command being run as a new script.
- * @param {bool=} verbose - (default false) If set to true, pid and result of command are logged.
+ * @param {string} command The ns command that should be invoked to get the desired data (e.g. "ns.getServer('home')" )
+ * @param {string?} fName (default "/Temp/{command-name}.txt") The name of the file to which data will be written to disk by a temporary process
+ * @param {any[]?} args args to be passed in as arguments to command being run as a new script.
+ * @param {boolean?} verbose (default false) If set to true, pid and result of command are logged.
  **/
 export async function getNsDataThroughFile(ns, command, fName = null, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50) {
     checkNsInstance(ns, '"getNsDataThroughFile"');
@@ -142,6 +143,7 @@ export async function getNsDataThroughFile(ns, command, fName = null, args = [],
 function getDefaultCommandFileName(command, ext = '.txt') {
     // If prefixed with "ns.", strip that out
     let fname = command;
+    if (fname.startsWith("await ")) fname = fname.slice(6);
     if (fname.startsWith("ns.")) fname = fname.slice(3);
     // Remove anything between parentheses
     fname = fname.replace(/ *\([^)]*\) */g, "");
@@ -151,12 +153,16 @@ function getDefaultCommandFileName(command, ext = '.txt') {
 }
 
 /**
- * An advanced version of getNsDataThroughFile that lets you pass your own "fnRun" implementation to reduce RAM requirements
- * Importing incurs no RAM (now that ns.read is free) plus whatever fnRun you provide it
+ * An advanced version of getNsDataThroughFile that lets you pass your own "fnRun" implementation to reduce RAM
+ * requirements (if you already reference ns.exec in your script, pass the result of `getFnRunViaNsExec(ns)`)
+ * Importing incurs no RAM (now that ns.read is free) plus whatever fnRun you provide it.
  * Has the capacity to retry if there is a failure (e.g. due to lack of RAM available). Not recommended for performance-critical code.
  * @param {NS} ns The nestcript instance passed to your script's main entry point
- * @param {function} fnRun - A single-argument function used to start the new sript, e.g. `ns.run` or `(f,...args) => ns.exec(f, "home", ...args)`
- * @param {args=} args - args to be passed in as arguments to command being run as a new script.
+ * @param {function} fnRun A single-argument function used to start the new sript, e.g. `ns.run` or `(f,...args) => ns.exec(f, "home", ...args)`
+ * @param {string} command The ns command that should be invoked to get the desired data (e.g. "ns.getServer('home')" )
+ * @param {string?} fName (default "/Temp/{command-name}.txt") The name of the file to which data will be written to disk by a temporary process
+ * @param {any[]?} args args to be passed in as arguments to command being run as a new script.
+ * @param {boolean?} verbose (default false) If set to true, pid and result of command are logged.
  **/
 export async function getNsDataThroughFile_Custom(ns, fnRun, command, fName = null, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50) {
     checkNsInstance(ns, '"getNsDataThroughFile_Custom"');
@@ -191,7 +197,7 @@ export async function getNsDataThroughFile_Custom(ns, fnRun, command, fName = nu
     const fnIsAlive = (ignored_pid) => ns.read(fName) === initialContents;
     await waitForProcessToComplete_Custom(ns, fnIsAlive, pid, verbose);
     if (verbose) log(ns, `Process ${pid} is done. Reading the contents of ${fName}...`);
-    // Read the file, with auto-retries if it fails // TODO: Unsure reading a file can fail or needs retrying. 
+    // Read the file, with auto-retries if it fails // TODO: Unsure reading a file can fail or needs retrying.
     let lastRead;
     const fileData = await autoRetry(ns, () => ns.read(fName),
         f => (lastRead = f) !== undefined && f !== "" && f !== initialContents && !(typeof f == "string" && f.startsWith("ERROR: ")),
@@ -209,10 +215,10 @@ export async function getNsDataThroughFile_Custom(ns, fnRun, command, fName = nu
 
 /** Evaluate an arbitrary ns command by writing it to a new script and then running or executing it.
  * @param {NS} ns The nestcript instance passed to your script's main entry point
- * @param {string} command - The ns command that should be invoked to get the desired data (e.g. "ns.getServer('home')" )
- * @param {string=} fileName - (default "/Temp/{command-name}.txt") The name of the file to which data will be written to disk by a temporary process
- * @param {args=} args - args to be passed in as arguments to command being run as a new script.
- * @param {bool=} verbose - (default false) If set to true, the evaluation result of the command is printed to the terminal
+ * @param {string} command The ns command that should be invoked to get the desired data (e.g. "ns.getServer('home')" )
+ * @param {string?} fileName (default "/Temp/{command-name}.txt") The name of the file to which data will be written to disk by a temporary process
+ * @param {any[]?} args args to be passed in as arguments to command being run as a new script.
+ * @param {boolean?} verbose (default false) If set to true, the evaluation result of the command is printed to the terminal
  */
 export async function runCommand(ns, command, fileName, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50) {
     checkNsInstance(ns, '"runCommand"');
@@ -239,10 +245,10 @@ function getExports(ns) {
  * An advanced version of runCommand that lets you pass your own "isAlive" test to reduce RAM requirements (e.g. to avoid referencing ns.isRunning)
  * Importing incurs 0 GB RAM (assuming fnRun, fnWrite are implemented using another ns function you already reference elsewhere like ns.exec)
  * @param {NS} ns The nestcript instance passed to your script's main entry point
- * @param {function} fnRun - A single-argument function used to start the new sript, e.g. `ns.run` or `(f,...args) => ns.exec(f, "home", ...args)`
- * @param {string} command - The ns command that should be invoked to get the desired data (e.g. "ns.getServer('home')" )
- * @param {string=} fileName - (default "/Temp/{commandhash}-data.txt") The name of the file to which data will be written to disk by a temporary process
- * @param {args=} args - args to be passed in as arguments to command being run as a new script.
+ * @param {function} fnRun A single-argument function used to start the new sript, e.g. `ns.run` or `(f,...args) => ns.exec(f, "home", ...args)`
+ * @param {string} command The ns command that should be invoked to get the desired data (e.g. "ns.getServer('home')" )
+ * @param {string?} fileName (default "/Temp/{commandhash}-data.txt") The name of the file to which data will be written to disk by a temporary process
+ * @param {any[]?} args args to be passed in as arguments to command being run as a new script.
  **/
 export async function runCommand_Custom(ns, fnRun, command, fileName, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50) {
     checkNsInstance(ns, '"runCommand_Custom"');
@@ -298,10 +304,10 @@ export async function runCommand_Custom(ns, fnRun, command, fileName, args = [],
 
 /**
  * Wait for a process id to complete running
- * Importing incurs a maximum of 0.1 GB RAM (for ns.isRunning) 
+ * Importing incurs a maximum of 0.1 GB RAM (for ns.isRunning)
  * @param {NS} ns The nestcript instance passed to your script's main entry point
- * @param {number} pid - The process id to monitor
- * @param {boolean} verbose - (default false) If set to true, pid and result of command are logged. **/
+ * @param {number} pid The process id to monitor
+ * @param {boolean?} verbose (default false) If set to true, pid and result of command are logged. **/
 export async function waitForProcessToComplete(ns, pid, verbose = false) {
     checkNsInstance(ns, '"waitForProcessToComplete"');
     if (!verbose) disableLogs(ns, ['isRunning']);
@@ -309,12 +315,12 @@ export async function waitForProcessToComplete(ns, pid, verbose = false) {
 }
 /**
  * An advanced version of waitForProcessToComplete that lets you pass your own "isAlive" test to reduce RAM requirements (e.g. to avoid referencing ns.isRunning)
- * Importing incurs 0 GB RAM (assuming fnIsAlive is implemented using another ns function you already reference elsewhere like ns.ps) 
+ * Importing incurs 0 GB RAM (assuming fnIsAlive is implemented using another ns function you already reference elsewhere like ns.ps)
  * @param {NS} ns The nestcript instance passed to your script's main entry point
- * @param {(pid: number) => Promise<boolean>} fnIsAlive - A single-argument function used to start the new sript, e.g. `ns.isRunning` or `pid => ns.ps("home").some(process => process.pid === pid)`
- * @param {number} pid - The process id to monitor
- * @param {boolean} verbose - (default false) If set to true, pid and result of command are logged. **/
-export async function waitForProcessToComplete_Custom(ns, fnIsAlive, pid, verbose) {
+ * @param {(pid: number) => Promise<boolean>} fnIsAlive A single-argument function used to start the new sript, e.g. `ns.isRunning` or `pid => ns.ps("home").some(process => process.pid === pid)`
+ * @param {number} pid The process id to monitor
+ * @param {boolean?} verbose (default false) If set to true, pid and result of command are logged. **/
+export async function waitForProcessToComplete_Custom(ns, fnIsAlive, pid, verbose = false) {
     checkNsInstance(ns, '"waitForProcessToComplete_Custom"');
     if (!verbose) disableLogs(ns, ['sleep']);
     // Wait for the PID to stop running (cheaper than e.g. deleting (rm) a possibly pre-existing file and waiting for it to be recreated)
@@ -369,7 +375,7 @@ export async function autoRetry(ns, fnFunctionThatMayFail, fnSuccessCondition, e
                     log(ns, `INFO: Attempt ${attempts} of ${maxRetries} failed. Trying again in ${retryDelayMs}ms...`, false, !verbose ? undefined : 'info');
                     continue;
                 }
-                // Otherwise, throw an error using the message provided by the errorContext string or function argument 
+                // Otherwise, throw an error using the message provided by the errorContext string or function argument
                 let errorMessage = typeof errorContext === 'string' ? errorContext : errorContext(result);
                 if (errorMessage instanceof Promise)
                     errorMessage = await errorMessage; // If the errorContext function was async, await its result
@@ -387,17 +393,38 @@ export async function autoRetry(ns, fnFunctionThatMayFail, fnSuccessCondition, e
     }
 }
 
-/** Helper for extracting the error message from an error thrown by the game. 
- * @param {string|Error} err A thrown error message or object
+/** Helper for extracting the error message from an error thrown by the game.
+ * @param {Error|string} err A thrown error message or object
 */
 export function getErrorInfo(err) {
     if (err === undefined || err == null) return "(null error)"; // Nothing caught
     if (typeof err === 'string') return err; // Simple string was thrown
-    if (typeof err === 'Error' || err.toString !== undefined && err.toString() != '[object Object]')
-        return err.toString(); // Meaningful toString implementation
-    if (err?.message) return err.message; // Has a message property
-    // Other objects will be serialized
-    return (typeof err) + ' { ' + Object.keys(err).map(key => `${key}: ${err[key]}`).join(', ') + ' }'; // Other objects will be serialized
+    let strErr = null;
+    // Add the stack trace below, if available
+    if (err instanceof Error) {
+        if (err.stack) // Stack is the most useful for debugging an issue. (Remove bitburner source code from the stack though.)
+            strErr = '  ' + err.stack.split('\n').filter(s => !s.includes('bitburner-official'))
+                .join('\n    '); // While we're here, indent the stack trace to help distinguish it from the rest.
+        if (err.cause) // Some errors have a nested "cause" error object - recurse!
+            strErr = (strErr ? strErr + '\n' : '') + getErrorInfo(err.cause);
+    }
+    // Get the default string representation of this object
+    let defaultToString = err.toString === undefined ? null : err.toString();
+    if (defaultToString && defaultToString != '[object Object]') { // Ensure the string representation is meaningful
+        // If we have no error message yet, use this
+        if (!strErr)
+            strErr = defaultToString
+        // If we have a stack trace, ensure it contains the error message (it doesn't always: https://mtsknn.fi/blog/js-error-stack/ )
+        else if (!strErr.includes(defaultToString))
+            strErr = `${defaultToString}\n  ${strErr}`;
+    }
+    if (strErr) return strErr.trimEnd(); // Some stack traces have trailing line breaks.
+    // Other types will be serialized
+    let typeName = typeof err; // Get the type thrown
+    // If the type is an "object", try to get its name from the constructor name (may be minified)
+    if (typeName == 'object') typeName = `${typeName} (${err.constructor.name})`;
+    return `non-Error type thrown: ${typeName}` +
+        ' { ' + Object.keys(err).map(key => `${key}: ${err[key]}`).join(', ') + ' }';
 }
 
 /** Helper to log a message, and optionally also tprint it and toast it
@@ -421,7 +448,7 @@ export function log(ns, message = "", alsoPrintToTerminal = false, toastStyle = 
 
 /** Helper to get a list of all hostnames on the network
  * @param {NS} ns The nestcript instance passed to your script's main entry point
- * @returns {string[]}>} **/
+ * @returns {string[]} **/
 export function scanAllServers(ns) {
     checkNsInstance(ns, '"scanAllServers"');
     let discoveredHosts = []; // Hosts (a.k.a. servers) we have scanned
@@ -458,26 +485,28 @@ export async function getActiveSourceFiles_Custom(ns, fnGetNsDataThroughFile, in
             `Object.fromEntries(ns.singularity.getOwnedSourceFiles().map(sf => [sf.n, sf.lvl]))`,
             '/Temp/owned-source-files.txt');
     } catch { dictSourceFiles = {}; } // If this fails (e.g. low RAM), return an empty dictionary
-    // If the user is currently in a given bitNode, they will have its features unlocked
+    // If the user is currently in a given bitnode, they will have its features unlocked
+    // TODO: This is true of BN4, but not BN14.2, Check them all!
     if (includeLevelsFromCurrentBitnode) {
         try {
             const currentNode = (await fnGetNsDataThroughFile(ns, 'ns.getResetInfo()', '/Temp/reset-info.txt')).currentNode;
-            dictSourceFiles[currentNode] = Math.max(3, dictSourceFiles[currentNode] || 0);
+            let effectiveSfLevel = currentNode == 4 ? 3 : 1; // In BN4, we get the perks of SF4.3
+            dictSourceFiles[currentNode] = Math.max(effectiveSfLevel, dictSourceFiles[currentNode] || 0);
         } catch { /* We are expected to be fault-tolerant in low-ram conditions */ }
     }
     return dictSourceFiles;
 }
 
 /** Return bitNode multiplers, or a best guess based on hard-coded values if they cannot currently be retrieved (no SF5, or insufficient RAM)
- *  @param {NS} ns The nestcript instance passed to your script's main entry point 
+ *  @param {NS} ns The nestcript instance passed to your script's main entry point
  * @returns {Promise<BitNodeMultipliers>} the current bitNode multipliers, or a best guess if we do not currently have access. */
 export async function tryGetBitNodeMultipliers(ns) {
     return await tryGetBitNodeMultipliers_Custom(ns, getNsDataThroughFile);
 }
 
 /** tryGetBitNodeMultipliers Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage
- * @param {NS} ns The nestcript instance passed to your script's main entry point 
- * @param {(ns: NS, command: string, fName?: string, args?: any, verbose?: any, maxRetries?: number, retryDelayMs?: number) => Promise<any>} fnGetNsDataThroughFile getActiveSourceFiles Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage 
+ * @param {NS} ns The nestcript instance passed to your script's main entry point
+ * @param {(ns: NS, command: string, fName?: string, args?: any, verbose?: any, maxRetries?: number, retryDelayMs?: number) => Promise<any>} fnGetNsDataThroughFile getActiveSourceFiles Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage
  * @returns {Promise<BitNodeMultipliers>} the current bitNode multipliers, or a best guess if we do not currently have access. */
 export async function tryGetBitNodeMultipliers_Custom(ns, fnGetNsDataThroughFile) {
     checkNsInstance(ns, '"tryGetBitNodeMultipliers"');
@@ -493,10 +522,10 @@ export async function tryGetBitNodeMultipliers_Custom(ns, fnGetNsDataThroughFile
     return await getHardCodedBitNodeMultipliers(ns, fnGetNsDataThroughFile);
 }
 
-/** Cheeky hard-coded values stolen from https://github.com/bitburner-official/bitburner-src/blob/dev/src/BitNode/BitNode.tsx#L456 
+/** Cheeky hard-coded values stolen from https://github.com/bitburner-official/bitburner-src/blob/dev/src/BitNode/BitNode.tsx#L456
  *  so that we essentially can provide bitNode multipliers even without SF-5 or sufficient RAM to request them.
  *  We still prefer to use the API though, this is just a a fallback, but it may become stale over time.
- * @param {NS} ns The nestcript instance passed to your script's main entry point  
+ * @param {NS} ns The nestcript instance passed to your script's main entry point
  * @param {(ns: NS, command: string, fName?: string, args?: any, verbose?: any, maxRetries?: number, retryDelayMs?: number) => Promise<any>} fnGetNsDataThroughFile getActiveSourceFiles Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage
  * @returns {Promise<BitNodeMultipliers>} a mocked BitNodeMultipliers instance with hard-coded values. */
 async function getHardCodedBitNodeMultipliers(ns, fnGetNsDataThroughFile) {
@@ -559,7 +588,7 @@ async function getHardCodedBitNodeMultipliers(ns, fnGetNsDataThroughFile) {
     }
 }
 
-/** Returns the number of instances of the current script running on the specified host. 
+/** Returns the number of instances of the current script running on the specified host.
  * @param {NS} ns The nestcript instance passed to your script's main entry point
  * @param {string} onHost - The host to search for the script on
  * @param {boolean} warn - Whether to automatically log a warning when there are more than other running instances
@@ -581,7 +610,7 @@ export async function instanceCount(ns, onHost = "home", warn = true, tailOtherI
 }
 
 /** Helper function to get all stock symbols, or null if you do not have TIX api access.
- *  @param {NS} ns The nestcript instance passed to your script's main entry point 
+ *  @param {NS} ns The nestcript instance passed to your script's main entry point
  * @returns {Promise<string[]>} array of stock symbols */
 export async function getStockSymbols(ns) {
     return await getNsDataThroughFile(ns,
@@ -590,7 +619,7 @@ export async function getStockSymbols(ns) {
 }
 
 /** Helper function to get the total value of stocks using as little RAM as possible.
- *  @param {NS} ns The nestcript instance passed to your script's main entry point 
+ *  @param {NS} ns The nestcript instance passed to your script's main entry point
  * @returns {Promise<number>} The current total dollar value of all owned stocks */
 export async function getStocksValue(ns) {
     let stockSymbols = await getStockSymbols(ns);
@@ -610,7 +639,7 @@ export async function getStocksValue(ns) {
             - 100000 * (Math.sign(stk.pos[0]) + Math.sign(stk.pos[2])), 0);
 }
 
-/** Returns a helpful error message if we forgot to pass the ns instance to a function 
+/** Returns a helpful error message if we forgot to pass the ns instance to a function
  *  @param {NS} ns The nestcript instance passed to your script's main entry point */
 export function checkNsInstance(ns, fnName = "this function") {
     if (ns === undefined || !ns.print) throw new Error(`The first argument to ${fnName} should be a 'ns' instance.`);
@@ -628,7 +657,7 @@ export function getConfiguration(ns, argsSchema) {
     // If the user has a local config file, override the defaults in the argsSchema
     const confName = `${scriptName}.config.txt`;
     const overrides = ns.read(confName);
-    const overriddenSchema = overrides ? [...argsSchema] : argsSchema; // Clone the original args schema    
+    const overriddenSchema = overrides ? [...argsSchema] : argsSchema; // Clone the original args schema
     if (overrides) {
         try {
             let parsedOverrides = JSON.parse(overrides); // Expect a parsable dict or array of 2-element arrays like args schema
