@@ -1,8 +1,22 @@
+import {
+    getConfiguration
+} from './helpers.js'
+
+const argsSchema = [
+	['backdoorable-only', false],
+];
+
+export function autocomplete(data, args) {
+	data.flags(argsSchema);
+	return [];
+}
+
 /**
  * @param {NS} ns
  * @returns interactive server map
  */
 export function main(ns) {
+    const runOptions = getConfiguration(ns, argsSchema);
     const factionServers = ["CSEC", "avmnite-02h", "I.I.I.I", "run4theh111z", "w0r1d_d43m0n", "fulcrumassets"],
         css = `    <style id="scanCSS">
         .serverscan {white-space:pre; color:#ccc; font:14px monospace; line-height: 16px; }
@@ -56,7 +70,16 @@ export function main(ns) {
                 + "</span>"
         },
         buildOutput = (parent = servers[0], prefix = ["\n"]) => {
-            let output = prefix.join("") + createServerEntry(parent)
+            let server = serverInfo(parent),
+                requiredHackLevel = server.requiredHackingSkill,
+                rooted = server.hasAdminRights,
+                canHack = requiredHackLevel <= myHackLevel,
+                shouldBackdoor = !server?.backdoorInstalled && canHack && parent != 'home' && rooted && !server.purchasedByPlayer;
+
+            let output = prefix.join("") + createServerEntry(parent);
+            if ( runOptions['backdoorable-only'] && !shouldBackdoor ) {
+                output = ""
+            }
             for (let i = 0; i < servers.length; i++) {
                 if (parentByIndex[i] != parent) continue
                 let newPrefix = prefix.slice()
