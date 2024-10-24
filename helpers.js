@@ -36,7 +36,7 @@ export function parseShortNumber(text = "0") {
 }
 
 /**
- * Return a number formatted with the specified number of significatnt figures or decimal places, whichever is more limiting.
+ * Return a number formatted with the specified number of significant figures or decimal places, whichever is more limiting.
  * @param {number} num - The number to format
  * @param {number=} minSignificantFigures - (default: 6) The minimum significant figures you wish to see (e.g. 123, 12.3 and 1.23 all have 3 significant figures)
  * @param {number=} minDecimalPlaces - (default: 3) The minimum decimal places you wish to see, regardless of significant figures. (e.g. 12.3, 1.2, 0.1 all have 1 decimal)
@@ -45,8 +45,24 @@ export function formatNumber(num, minSignificantFigures = 3, minDecimalPlaces = 
     return num == 0.0 ? num : num.toFixed(Math.max(minDecimalPlaces, Math.max(0, minSignificantFigures - Math.ceil(Math.log10(num)))));
 }
 
-/** Formats some RAM amount as a round number of GB with thousands separators e.g. `1,028 GB` */
-export function formatRam(num) { return `${Math.round(num).toLocaleString('en')} GB`; }
+const memorySuffixes = ["GB", "TB", "PB", "EB"];
+
+/** Formats some RAM amount as a round number of GB/TB/PB/EB with thousands separators e.g. `1.028 TB` */
+export function formatRam(num, printGB) {
+    if (printGB) {
+        return `${Math.round(num).toLocaleString('en')} GB`;
+    }
+    let idx = Math.floor(Math.log10(num) / 3) || 0;
+    if (idx >= memorySuffixes.length) {
+        idx = memorySuffixes.length - 1;
+    } else if (idx < 0) {
+        idx = 0;
+    }
+    const scaled = num / 1000 ** idx; // Scale the number to the order of magnitude chosen
+    // Only display decimal places if there are any
+    const formatted = scaled - Math.round(scaled) == 0 ? Math.round(scaled) : formatNumber(num / 1000 ** idx);
+    return formatted.toLocaleString('en') + " " + memorySuffixes[idx];
+}
 
 /** Return a datatime in ISO format */
 export function formatDateTime(datetime) { return datetime.toISOString(); }
@@ -131,11 +147,12 @@ export function getFnIsAliveViaNsPs(ns) {
  * @param {string?} fName (default "/Temp/{command-name}.txt") The name of the file to which data will be written to disk by a temporary process
  * @param {any[]?} args args to be passed in as arguments to command being run as a new script.
  * @param {boolean?} verbose (default false) If set to true, pid and result of command are logged.
+ * TODO: Switch to an args object, this is getting ridiculous
  **/
-export async function getNsDataThroughFile(ns, command, fName = null, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50) {
+export async function getNsDataThroughFile(ns, command, fName = null, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50, silent = false) {
     checkNsInstance(ns, '"getNsDataThroughFile"');
     if (!verbose) disableLogs(ns, ['run', 'isRunning']);
-    return await getNsDataThroughFile_Custom(ns, ns.run, command, fName, args, verbose, maxRetries, retryDelayMs);
+    return await getNsDataThroughFile_Custom(ns, ns.run, command, fName, args, verbose, maxRetries, retryDelayMs, silent);
 }
 
 /** Convert a command name like "ns.namespace.someFunction(args, args)" into
@@ -164,8 +181,10 @@ function getDefaultCommandFileName(command, ext = '.txt') {
  * @param {any[]?} args args to be passed in as arguments to command being run as a new script.
  * @param {boolean?} verbose (default false) If set to true, pid and result of command are logged.
  **/
-export async function getNsDataThroughFile_Custom(ns, fnRun, command, fName = null, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50) {
+export async function getNsDataThroughFile_Custom(ns, fnRun, command, fName = null, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50, silent = false) {
     checkNsInstance(ns, '"getNsDataThroughFile_Custom"');
+    // If any args were skipped by passing null or undefined, set them to the default
+    if (args == null) args = []; if (verbose == null) verbose = false; if (maxRetries = null) maxRetries = 5; if (retryDelayMs = null) retryDelayMs = 50; if (silent == null) silent = false;
     if (!verbose) disableLogs(ns, ['read']);
     fName = fName || getDefaultCommandFileName(command);
     const fNameCommand = fName + '.js'
@@ -192,7 +211,7 @@ export async function getNsDataThroughFile_Custom(ns, fnRun, command, fName = nu
         `);}catch(e){r="ERROR: "+(typeof e=='string'?e:e?.message??JSON.stringify(e));}\n` +
         `const f="${fName}"; if(ns.read(f)!==r) ns.write(f,r,'w')`;
     // Run the command with auto-retries if it fails
-    const pid = await runCommand_Custom(ns, fnRun, commandToFile, fNameCommand, args, verbose, maxRetries, retryDelayMs);
+    const pid = await runCommand_Custom(ns, fnRun, commandToFile, fNameCommand, args, verbose, maxRetries, retryDelayMs, silent);
     // Wait for the process to complete. Note, as long as the above returned a pid, we don't actually have to check it, just the file contents
     const fnIsAlive = (ignored_pid) => ns.read(fName) === initialContents;
     await waitForProcessToComplete_Custom(ns, fnIsAlive, pid, verbose);
@@ -208,9 +227,28 @@ export async function getNsDataThroughFile_Custom(ns, fnRun, command, fName = nu
                     lastRead == "" ? `\nThe file appears to have been deleted before a result could be retrieved. Perhaps there is a conflicting script.` :
                         lastRead.includes('API ACCESS ERROR') ? `\nThis script should not have been run until you have the required Source-File upgrades. Sorry about that.` :
                             `\nThe script was likely passed invalid arguments. Please post a screenshot of this error on discord.`),
-        maxRetries, retryDelayMs, undefined, verbose, verbose);
+        maxRetries, retryDelayMs, undefined, verbose, verbose, silent);
     if (verbose) log(ns, `Read the following data for command ${command}:\n${fileData}`);
-    return JSON.parse(fileData); // Deserialize it back into an object/array and return
+    return JSON.parse(fileData, jsonReviver); // Deserialize it back into an object/array and return
+}
+
+/** Allows us to serialize types not normally supported by JSON.serialize */
+export function jsonReplacer(key, value) {
+    if (typeof value === 'bigint') {
+        return {
+            type: 'bigint',
+            value: value.toString()
+        };
+    } else {
+        return value;
+    }
+}
+
+/** Allows us to deserialize special values created by the above jsonReplacer */
+export function jsonReviver(key, value) {
+    if (value && value.type == 'bigint')
+        return BigInt(value.value);
+    return value;
 }
 
 /** Evaluate an arbitrary ns command by writing it to a new script and then running or executing it.
@@ -220,10 +258,10 @@ export async function getNsDataThroughFile_Custom(ns, fnRun, command, fName = nu
  * @param {any[]?} args args to be passed in as arguments to command being run as a new script.
  * @param {boolean?} verbose (default false) If set to true, the evaluation result of the command is printed to the terminal
  */
-export async function runCommand(ns, command, fileName, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50) {
+export async function runCommand(ns, command, fileName, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50, silent = false) {
     checkNsInstance(ns, '"runCommand"');
     if (!verbose) disableLogs(ns, ['run']);
-    return await runCommand_Custom(ns, ns.run, command, fileName, args, verbose, maxRetries, retryDelayMs);
+    return await runCommand_Custom(ns, ns.run, command, fileName, args, verbose, maxRetries, retryDelayMs, silent);
 }
 
 const _cachedExports = [];
@@ -250,13 +288,15 @@ function getExports(ns) {
  * @param {string?} fileName (default "/Temp/{commandhash}-data.txt") The name of the file to which data will be written to disk by a temporary process
  * @param {any[]?} args args to be passed in as arguments to command being run as a new script.
  **/
-export async function runCommand_Custom(ns, fnRun, command, fileName, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50) {
+export async function runCommand_Custom(ns, fnRun, command, fileName, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50, silent = false) {
     checkNsInstance(ns, '"runCommand_Custom"');
     if (!Array.isArray(args)) throw new Error(`args specified were a ${typeof args}, but an array is required.`);
     if (!verbose) disableLogs(ns, ['sleep']);
     // Auto-import any helpers that the temp script attempts to use
-    const required = getExports(ns).filter(e => command.includes(`${e}(`));
-    let script = (required.length > 0 ? `import { ${required.join(", ")} } from 'helpers.js'\n` : '') +
+    let importFunctions = getExports(ns).filter(e => command.includes(`${e}`)) // Check if the script includes the name of any functions
+        // To avoid false positives, narrow these to "whole word" matches (no alpha characters on either side)
+        .filter(e => new RegExp(`(^|[^\\w])${e}([^\\w]|\$)`).test(command));
+    let script = (importFunctions.length > 0 ? `import { ${importFunctions.join(", ")} } from 'helpers.js'\n` : '') +
         `export async function main(ns) { ${command} }`;
     fileName = fileName || getDefaultCommandFileName(command, '.js');
     if (verbose)
@@ -274,18 +314,20 @@ export async function runCommand_Custom(ns, fnRun, command, fileName, args = [],
             ns.write(fileName, script, "w");
             // Wait for the script to appear and be readable (game can be finicky on actually completing the write)
             await autoRetry(ns, () => ns.read(fileName), c => c == script, () => `Temporary script ${fileName} is not available, ` +
-                `despite having written it. (Did a competing process delete or overwrite it?)`, maxRetries, retryDelayMs, undefined, verbose, verbose);
+                `despite having written it. (Did a competing process delete or overwrite it?)`, maxRetries, retryDelayMs, undefined, verbose, verbose, silent);
         }
+        // NEW! We can inject "RunOptions" as the middle arg (rather than an integer thread count)
         // Run the script, now that we're sure it is in place
-        return fnRun(fileName, 1 /* Always 1 thread */, ...args);
+        return fnRun(fileName, { temporary: true }, ...args);
     }, pid => pid !== 0,
         async () => {
+            if (silent) return `(silent = true)`; // No reason needed in silent mode, messages should all be suppressed
             let reason = " (likely due to insufficient RAM)";
             // Just to be super clear - try to find out how much ram this script requires vs what we have available
             try {
-                const reqRam = await getNsDataThroughFile_Custom(ns, fnRun, 'ns.getScriptRam(ns.args[0])', null, [fileName]);
-                const homeMaxRam = await getNsDataThroughFile_Custom(ns, fnRun, 'ns.getServerMaxRam(ns.args[0])', null, ["home"]);
-                const homeUsedRam = await getNsDataThroughFile_Custom(ns, fnRun, 'ns.getServerUsedRam(ns.args[0])', null, ["home"]);
+                const reqRam = await getNsDataThroughFile_Custom(ns, fnRun, 'ns.getScriptRam(ns.args[0])', null, [fileName], false, 1, 0, true);
+                const homeMaxRam = await getNsDataThroughFile_Custom(ns, fnRun, 'ns.getServerMaxRam(ns.args[0])', null, ["home"], false, 1, 0, true);
+                const homeUsedRam = await getNsDataThroughFile_Custom(ns, fnRun, 'ns.getServerUsedRam(ns.args[0])', null, ["home"], false, 1, 0, true);
                 if (reqRam > homeMaxRam)
                     reason = ` as it requires ${formatRam(reqRam)} RAM, but home only has ${formatRam(homeMaxRam)}`;
                 else if (reqRam > homeMaxRam - homeUsedRam)
@@ -299,7 +341,7 @@ export async function runCommand_Custom(ns, fnRun, command, fileName, args = [],
                 `\n  Script:  ${fileName}\n  Args:    ${JSON.stringify(args)}\n  Command: ${command}` +
                 `\nThe script that ran this will likely recover and try again later.`
         },
-        maxRetries, retryDelayMs, undefined, verbose, verbose);
+        maxRetries, retryDelayMs, undefined, verbose, verbose, silent);
 }
 
 /**
@@ -352,7 +394,7 @@ function asError(error) {
 /** Helper to retry something that failed temporarily (can happen when e.g. we temporarily don't have enough RAM to run)
  * @param {NS} ns The nestcript instance passed to your script's main entry point */
 export async function autoRetry(ns, fnFunctionThatMayFail, fnSuccessCondition, errorContext = "Success condition not met",
-    maxRetries = 5, initialRetryDelayMs = 50, backoffRate = 3, verbose = false, tprintFatalErrors = true) {
+    maxRetries = 5, initialRetryDelayMs = 50, backoffRate = 3, verbose = false, tprintFatalErrors = true, silent = false) {
     checkNsInstance(ns, '"autoRetry"');
     let retryDelayMs = initialRetryDelayMs, attempts = 0;
     let sucessConditionMet;
@@ -368,11 +410,11 @@ export async function autoRetry(ns, fnFunctionThatMayFail, fnSuccessCondition, e
             // Check if this is considered a successful result
             sucessConditionMet = fnSuccessCondition(result);
             if (sucessConditionMet instanceof Promise)
-                sucessConditionMet = await errorMessage; // If fnSuccessCondition was async, await its result
+                sucessConditionMet = await sucessConditionMet; // If fnSuccessCondition was async, await its result
             if (!sucessConditionMet) {
                 // If we have not yet reached our maximum number of retries, we can continue, without throwing
                 if (attempts < maxRetries) {
-                    log(ns, `INFO: Attempt ${attempts} of ${maxRetries} failed. Trying again in ${retryDelayMs}ms...`, false, !verbose ? undefined : 'info');
+                    if (!silent) log(ns, `INFO: Attempt ${attempts} of ${maxRetries} failed. Trying again in ${retryDelayMs}ms...`, false, !verbose ? undefined : 'info');
                     continue;
                 }
                 // Otherwise, throw an error using the message provided by the errorContext string or function argument
@@ -385,7 +427,7 @@ export async function autoRetry(ns, fnFunctionThatMayFail, fnSuccessCondition, e
         }
         catch (error) {
             const fatal = attempts >= maxRetries;
-            log(ns, `${fatal ? 'FAIL' : 'INFO'}: Attempt ${attempts} of ${maxRetries} raised an error` +
+            if (!silent) log(ns, `${fatal ? 'FAIL' : 'INFO'}: Attempt ${attempts} of ${maxRetries} raised an error` +
                 (fatal ? `: ${getErrorInfo(error)}` : `. Trying again in ${retryDelayMs}ms...`),
                 tprintFatalErrors && fatal, !verbose ? undefined : (fatal ? 'error' : 'info'))
             if (fatal) throw asError(error);
@@ -414,8 +456,8 @@ export function getErrorInfo(err) {
         // If we have no error message yet, use this
         if (!strErr)
             strErr = defaultToString
-        // If we have a stack trace, ensure it contains the error message (it doesn't always: https://mtsknn.fi/blog/js-error-stack/ )
-        else if (!strErr.includes(defaultToString))
+        // Add the error message if the stack didn't already include it (it doesn't always: https://mtsknn.fi/blog/js-error-stack/ )
+        else if (!err.stack || !err.stack.includes(defaultToString))
             strErr = `${defaultToString}\n  ${strErr}`;
     }
     if (strErr) return strErr.trimEnd(); // Some stack traces have trailing line breaks.
@@ -466,30 +508,33 @@ export function scanAllServers(ns) {
 
 /** Get a dictionary of active source files, taking into account the current active bitNode as well (optionally disabled).
  * @param {NS} ns The nestcript instance passed to your script's main entry point
+ * @param {bool} includeLevelsFromCurrentBitnode Set to true to use the current bitNode number to infer the effective source code level (for purposes of determining what features are unlocked)
+ * @param {bool} silent Set to true if you want to minimize logging errors (e.g. due to not owning singularity or having insufficient RAM)
  * @returns {Promise<{[k: number]: number}>} A dictionary keyed by source file number, where the value is the level (between 1 and 3 for all but BN12) **/
-export async function getActiveSourceFiles(ns, includeLevelsFromCurrentBitnode = true) {
-    return await getActiveSourceFiles_Custom(ns, getNsDataThroughFile, includeLevelsFromCurrentBitnode);
+export async function getActiveSourceFiles(ns, includeLevelsFromCurrentBitnode = true, silent = true) {
+    return await getActiveSourceFiles_Custom(ns, getNsDataThroughFile, includeLevelsFromCurrentBitnode, silent);
 }
 
 /** getActiveSourceFiles Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage
  * @param {NS} ns The nestcript instance passed to your script's main entry point
- * @param {(ns: NS, command: string, fName?: string, args?: any, verbose?: any, maxRetries?: number, retryDelayMs?: number) => Promise<any>} fnGetNsDataThroughFile getActiveSourceFiles Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage
+ * @param {(ns: NS, command: string, fName?: string, args?: any, verbose?: any, maxRetries?: number, retryDelayMs?: number, silent?: bool) => Promise<any>} fnGetNsDataThroughFile getActiveSourceFiles Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage
  * @param {bool} includeLevelsFromCurrentBitnode Set to true to use the current bitNode number to infer the effective source code level (for purposes of determining what features are unlocked)
+ * @param {bool} silent Set to true if you want to minimize logging errors (e.g. due to not owning singularity or having insufficient RAM)
  * @returns {Promise<{[k: number]: number}>} A dictionary keyed by source file number, where the value is the level (between 1 and 3 for all but BN12) **/
-export async function getActiveSourceFiles_Custom(ns, fnGetNsDataThroughFile, includeLevelsFromCurrentBitnode = true) {
+export async function getActiveSourceFiles_Custom(ns, fnGetNsDataThroughFile, includeLevelsFromCurrentBitnode = true, silent = true) {
     checkNsInstance(ns, '"getActiveSourceFiles"');
     // Find out what source files the user has unlocked
     let dictSourceFiles;
     try {
         dictSourceFiles = await fnGetNsDataThroughFile(ns,
             `Object.fromEntries(ns.singularity.getOwnedSourceFiles().map(sf => [sf.n, sf.lvl]))`,
-            '/Temp/owned-source-files.txt');
-    } catch { dictSourceFiles = {}; } // If this fails (e.g. low RAM), return an empty dictionary
+            '/Temp/owned-source-files.txt', null, null, null, null, silent);
+    } catch { dictSourceFiles = {}; } // If this fails (e.g. presumably due to low RAM or no singularity access), return an empty dictionary
     // If the user is currently in a given bitnode, they will have its features unlocked
     // TODO: This is true of BN4, but not BN14.2, Check them all!
     if (includeLevelsFromCurrentBitnode) {
         try {
-            const currentNode = (await fnGetNsDataThroughFile(ns, 'ns.getResetInfo()', '/Temp/reset-info.txt')).currentNode;
+            const currentNode = (await fnGetNsDataThroughFile(ns, 'ns.getResetInfo()', '/Temp/reset-info.txt', null, null, null, null, silent)).currentNode;
             let effectiveSfLevel = currentNode == 4 ? 3 : 1; // In BN4, we get the perks of SF4.3
             dictSourceFiles[currentNode] = Math.max(effectiveSfLevel, dictSourceFiles[currentNode] || 0);
         } catch { /* We are expected to be fault-tolerant in low-ram conditions */ }
@@ -506,17 +551,17 @@ export async function tryGetBitNodeMultipliers(ns) {
 
 /** tryGetBitNodeMultipliers Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage
  * @param {NS} ns The nestcript instance passed to your script's main entry point
- * @param {(ns: NS, command: string, fName?: string, args?: any, verbose?: any, maxRetries?: number, retryDelayMs?: number) => Promise<any>} fnGetNsDataThroughFile getActiveSourceFiles Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage
+ * @param {(ns: NS, command: string, fName?: string, args?: any, verbose?: any, maxRetries?: number, retryDelayMs?: number, silent?: bool) => Promise<any>} fnGetNsDataThroughFile getActiveSourceFiles Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage
  * @returns {Promise<BitNodeMultipliers>} the current bitNode multipliers, or a best guess if we do not currently have access. */
 export async function tryGetBitNodeMultipliers_Custom(ns, fnGetNsDataThroughFile) {
     checkNsInstance(ns, '"tryGetBitNodeMultipliers"');
     let canGetBitNodeMultipliers = false;
-    try {
-        canGetBitNodeMultipliers = 5 in (await getActiveSourceFiles_Custom(ns, fnGetNsDataThroughFile));
+    try { // We use make use of the "silent" parameter in our requests below because we have a fall-back for low-ram conditions, and don't want to confuse the player with warning/error logs
+        canGetBitNodeMultipliers = 5 in (await getActiveSourceFiles_Custom(ns, fnGetNsDataThroughFile, /*silent:*/true));
     } catch { }
     if (canGetBitNodeMultipliers) {
         try {
-            return await fnGetNsDataThroughFile(ns, 'ns.getBitNodeMultipliers()', '/Temp/bitNode-multipliers.txt');
+            return await fnGetNsDataThroughFile(ns, 'ns.getBitNodeMultipliers()', '/Temp/bitNode-multipliers.txt', null, null, null, null, /*silent:*/true);
         } catch { }
     }
     return await getHardCodedBitNodeMultipliers(ns, fnGetNsDataThroughFile);
@@ -589,6 +634,7 @@ async function getHardCodedBitNodeMultipliers(ns, fnGetNsDataThroughFile) {
 }
 
 /** Returns the number of instances of the current script running on the specified host.
+ *  Uses ram-dodging (which costs 1GB for ns.run if you aren't already using it.
  * @param {NS} ns The nestcript instance passed to your script's main entry point
  * @param {string} onHost - The host to search for the script on
  * @param {boolean} warn - Whether to automatically log a warning when there are more than other running instances

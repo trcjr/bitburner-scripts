@@ -4,11 +4,6 @@ import {
     formatMoney, formatDuration, getErrorInfo
 } from './helpers.js'
 
-const persistentLog = "log.autopilot.txt";
-const factionManagerOutputFile = "/Temp/affordable-augs.txt"; // Temp file produced by faction manager with status information
-const casinoFlagFile = "/Temp/ran-casino.txt";
-const defaultBnOrder = [4.3, 1.3, 14.3, 5.1, 9.2, 10.1, 2.1, 8.2, 10.3, 9.3, 11.3, 13.3, 5.3, 7.1, 6.3, 7.3, 2.3, 8.3, 3.3, 12.999];
-
 let options; // The options used at construction time
 const argsSchema = [ // The set of all command line arguments
     ['next-bn', 0], // If we destroy the current BN, the next BN to start
@@ -28,11 +23,10 @@ const argsSchema = [ // The set of all command line arguments
     ['disable-wait-for-4s', false], // If true, will doesn't wait for the 4S Tix API to be acquired under any circumstantes
     ['disable-rush-gangs', false], // Set to true to disable focusing work-for-faction on Karma until gangs are unlocked
     ['disable-casino', false], // Set to true to disable running the casino.js script automatically
-    ['disable-go', false], // Set to true to disable the Go script
     ['on-completion-script', null], // Spawn this script when we defeat the bitnode
     ['on-completion-script-args', []], // Optional args to pass to the script when we defeat the bitnode
-    ['xp-mode-interval-minutes', 60], // Every time this many minutes has elapsed, toggle daemon.js to runing in --xp-only mode, which prioritizes earning hack-exp rather than money
-    ['xp-mode-duration-minutes', 10], // The number of minutes to keep daemon.js in --xp-only mode before switching back to normal money-earning mode.
+    ['xp-mode-interval-minutes', 55], // Every time this many minutes has elapsed, toggle daemon.js to runing in --xp-only mode, which prioritizes earning hack-exp rather than money
+    ['xp-mode-duration-minutes', 5], // The number of minutes to keep daemon.js in --xp-only mode before switching back to normal money-earning mode.
 ];
 export function autocomplete(data, args) {
     data.flags(argsSchema);
@@ -41,6 +35,46 @@ export function autocomplete(data, args) {
         return data.scripts;
     return [];
 }
+
+const persistentLog = "log.autopilot.txt";
+const factionManagerOutputFile = "/Temp/affordable-augs.txt"; // Temp file produced by faction manager with status information
+const casinoFlagFile = "/Temp/ran-casino.txt";
+const defaultBnOrder = [ // The order in which we intend to play bitnodes
+    // 1st Priority: Key new features and/or major stat boosts
+    4.3,  // Normal. Need singularity to automate everything, and need the API costs reduced from 16x -> 4x -> 1x reliably do so from the start of each BN
+    1.2,  // Easy.   Big boost to all multipliers (16% -> 24%), and no penalties to slow us down. Should go quick.
+    5.1,  // Normal. Unlock intelligence stat early to maximize growth, getBitNodeMultipliers + Formulas.exe for more accurate scripts, and +8% hack mults
+    14.2, // Normal. Boosts the powerful go.js bonuses quite a lot but note that we can automate IPvGO from the very start (BN1.1), no need to unlock it.
+    1.3,  // Easy.   The last bonus is not as big a jump (24% -> 28%), but it's low-hanging fruit
+    2.1,  // Easy.   Unlocks gangs, which reduces the need to grind faction and company rep for getting access to most augmentations, speeding up all BNs
+
+    // 2nd Priority: More new features, from Harder BNs. Things will slow down for a while, but the new features should pay in dividends for all future BNs
+    10.1, // Hard.   Unlock Sleeves (which tremendously speed along gangs outside of BN2) and grafting (can speed up slow rep-gain BNs). // TODO: Buying / upgrading sleeve mem has no API, requires manual interaction. Can we automate this with UI clicking like casino.js?
+    8.2,  // Hard.   8.1 immediately unlocks stocks, 8.2 doubles stock earning rate with shorts. Stocks are never nerfed in any BN (4S can be made too pricey though), and we have a good pre-4S stock script.
+    13.1, // Hard.   Unlock Stanek's Gift. We've put a lot of effort into min/maxing the Tetris, so we should try to get it early, even though it's a hard BN. I might change my mind and push this down if it proves too slow.
+    7.1,  // Hard.   Unlocks the bladeburner API (TODO: Can we still play bladeburner in other BNs without 6.1?) Many recommend it before BN9 since it may end up being a faster win condition in some of the tougher bitnodes ahead. I'm on the fence.
+    9.1,  // Hard.   Unlocks hacknet servers. Hashes can be earned and spent on cash very early in a tough BN to help kick-start things. Hacknet productin/costs improved by 12%
+
+    // 3nd Priority: With most features unlocked, max out SF levels roughly in the order of greatest boost and/or easiest difficulty, to hardest and/or less worthwhile
+    2.3,  // Easy.   Boosts to crime success / money / CHA will speed along gangs, training and earning augmentations in the future
+    5.3,  // Normal. Diminishing boost to hacking multipliers (8% -> 12% -> 14%), but relatively normal bitnode, especially with other features unlocked
+    11.3, // Normal. Decrease augmentation cost scaling in a reset (4% -> 6% -> 7%) (can buy more augs per reset). Also boosts company salary/rep (32% -> 48% -> 56%), which we have little use for with gangs.)
+    14.3, // Normal: Makes go.js cheats slightly more successful, increases max go favour from (100->120) and not too difficult to get out of the way
+    13.3, // Hard.   Make stanek's gift bigger to get more/different boosts
+    9.2,  // Hard.   Start with 128 GB home ram. Speeds up slow-starting new BNs, but less important with good ram-dodging scripts. Hacknet productin/costs improved by 12% -> 18%.
+    9.3,  // Hard.   Start each new BN with an already powerful hacknet server, but *only until the first reset*, which is a bit of a damper. Hacknet productin/costs improved by 18% -> 21%
+    10.3, // Hard.   Get the last 2 sleeves (6 => 8) to boost their productivity ~30%. These really help with Bladeburner below. Putting this a little later because buying sleeves memory upgrades requires manual intervention right now.
+
+    // 4th Priority: Play some Bladeburners. Mostly not used to beat other BNs, because for much of the BN this can't be done concurrently with player actions like crime/faction work, and no other BNs are "tuned" to be beaten via Bladeburner win condition
+    7.1,  // Hard.   Unlock the Bladeburner API, required to automate these 6 BNs (and boosts future Bladeburner mults by 8%)
+    6.3,  // Normal. The 3 easier bladeburner BNs. Boosts combat stats by 8% -> 12% -> 14%
+    7.3,  // Hard.   The remaining 2 hard bladeburner BNs. Boosts all Bladeburner mults by 8% -> 12% -> 14%, so no interaction with other BNs unless trying to win via Bladeburner.
+
+    // Low Priority:
+    8.3,  // Hard.   Just gives stock "Limit orders" which we don't use in our scripts,
+    3.3,  // Hard.   Corporations. I have no corp scripts, maybe one day I will. The history here is: in 2021, corps were too exploity and broke the game (inf. money). Also the APIs were buggy and new, so I skipped it. Autopilot will win normally while ignoring corps.
+    12.9999 // Easy. Keep playing forever. Only stanek scales very well here, there is much work to be done to be able to climb these faster.
+];
 
 let playerInGang = false, rushGang = false; // Tells us whether we're should be trying to work towards getting into a gang
 let playerInBladeburner = false; // Whether we've joined bladeburner
@@ -70,7 +104,7 @@ export async function main(ns) {
 
     log(ns, "INFO: Auto-pilot engaged...", true, 'info');
     // The game does not allow boolean flags to be turned "off" via command line, only on. Since this gets saved, notify the user about how they can turn it off.
-    const flagsSet = ['disable-auto-destroy-bn', 'disable-bladeburner', 'disable-wait-for-4s', 'disable-rush-gangs', 'disable-go'].filter(f => options[f]);
+    const flagsSet = ['disable-auto-destroy-bn', 'disable-bladeburner', 'disable-wait-for-4s', 'disable-rush-gangs'].filter(f => options[f]);
     for (const flag of flagsSet)
         log(ns, `WARNING: You have previously enabled the flag "--${flag}". Because of the way this script saves its run settings, the ` +
             `only way to now turn this back off will be to manually edit or delete the file ${ns.getScriptName()}.config.txt`, true);
@@ -221,7 +255,11 @@ async function checkOnDaedalusStatus(ns, player, stocksValue) {
     if (player.skills.hacking < 2500) {
         // If we happen to already have enough money for daedalus and are only waiting on hack-level,
         // set a flag to switch daemon.js into --xp-only mode, to prioritize earning hack exp over money
-        if (totalWorth >= moneyReq) prioritizeHackForDaedalus = true;
+        // HEURISTIC (i.e. Hack): Only do this if we naturally get within 90% of the hack stat requirement,
+        //    otherwise, assume our hack gain rate is too low in this reset to make it all the way to 2500.
+        if (totalWorth >= moneyReq && player.skills.hacking >= (2500 * 0.90))
+            prioritizeHackForDaedalus = true;
+        log(ns, `total worth: ${formatMoney(totalWorth)} moneyReq: ${formatMoney(moneyReq)} prioritizeHackForDaedalus: ${prioritizeHackForDaedalus}`)
         return reservingMoneyForDaedalus = false; // Don't reserve money until hack level suffices
     }
     // If we have sufficient augs and hacking, the only requirement left is the money (100b)
@@ -287,10 +325,19 @@ async function checkIfBnIsComplete(ns, player) {
     if (resetInfo.currentNode == 10) { // Suggest the user doesn't reset until they buy all sleeves and max memory
         const shouldHaveSleeveCount = Math.min(8, 6 + (dictOwnedSourceFiles[10] || 0));
         const numSleeves = await getNsDataThroughFile(ns, `ns.sleeve.getNumSleeves()`);
-        if (numSleeves < shouldHaveSleeveCount) {
-            log(ns, `WARNING: Detected that you only have ${numSleeves} sleeves, but you could have ${shouldHaveSleeveCount}.` +
-                `\nTry not to leave BN10 before buying all you can from the faction "The Covenant", especially sleeve memory!` +
-                `\nNOTE: You can ONLY buy sleeves/memory from The Covenant in BN10, which is why it's important to do this before you leave.`, true);
+        let reasonToStay = null;
+        if (numSleeves < shouldHaveSleeveCount)
+            reasonToStay = `Detected that you only have ${numSleeves} sleeves, but you could have ${shouldHaveSleeveCount}.`;
+        else {
+            let sleeveInfo = (/** @returns {SleevePerson[]} */() => [])();
+            await getNsDataThroughFile(ns, `ns.args.map(i => ns.sleeve.getSleeve(i))`, '/Temp/sleeve-getSleeve-all.txt', [...Array(numSleeves).keys()]);
+            if (sleeveInfo.some(s => s.memory < 100))
+                reasonToStay = `Detected that you have ${numSleeves}/${shouldHaveSleeveCount} sleeves, but they do not all have the maximum memory of 100:\n  ` +
+                    sleeveInfo.map((s, i) => `- Sleeve ${i} has ${s.memory}/100 memory`).join('\n  ');
+        }
+        if (reasonToStay) {
+            log(ns, `WARNING: ${reasonToStay}\nTry not to leave BN10 before buying all you can from the faction "The Covenant", especially sleeve memory!` +
+                `\nNOTE: You can ONLY buy sleeves & memory from The Covenant in BN10, which is why it's important to do this before you leave.`, true);
             return bnCompletionSuppressed = true;
         }
     }
@@ -417,7 +464,7 @@ async function checkOnRunningScripts(ns, player) {
         const hackThreshold = options['high-hack-threshold']; // If player.skills.hacking level is about 8000, run in "start-tight" mode
         // When our hack level gets sufficiently high, hack/grow/weaken go so fast that spawning new scripts for each cycle becomes very
         // expensive / laggy. To help with this, daemon.js supports "looping mode", to just spawn one long-lived script that does H/G/W in a loop.
-        if (player.skills.hacking >= hackThreshold) {
+        if (false /* TODO: LOOPING MODE DISABLED UNTIL WORKING BETTER */ && player.skills.hacking >= hackThreshold) {
             daemonArgs = ["--looping-mode", "--cycle-timing-delay", 2000, "--queue-delay", "10", "--initial-max-targets", "63", "--silent-misfires", "--no-share",
                 // Use recovery thread padding sparingly until our hack level is significantly higher (capped at 3x padding)
                 "--recovery-thread-padding", 1.0 + Math.max(2, (player.skills.hacking - hackThreshold) / 1000.0)];
@@ -428,18 +475,17 @@ async function checkOnRunningScripts(ns, player) {
         // Periodically try to push higher hack levels by running daemon.js in "xp-focus" mode, where it prioritizes earning hack exp rather than money
         // Once we decide to put daemon.js in --looping mode though, we should no longer do this, since TODO: currently it does not kill it's loops on shutdown, so they'll be stuck in --xp-only mode
         else if (prioritizeHackForDaedalus || bitNodeMults.ScriptHackMoney == 0) { // In BNs that give no money for hacking, always start daemon.js in --xp-only mode
-            daemonArgs.push("--xp-only", "--silent-misfires");
+            daemonArgs.push("--xp-only", "--silent-misfires", "--no-share");
             if (!existingDaemon?.args.includes("--xp-only"))
                 daemonRelaunchMessage = prioritizeHackForDaedalus ?
                     `Hack Level is the only missing requirement for Daedalus, so we will run daemon.js in --xp-only mode to try and speed along the invite.` :
                     `The current BitNode does not give any money from hacking, so we will run daemon.js in --xp-only mode.`;
         } else { // Otherwise, respect the configured interval / duration
-            const xpInterval = options['xp-mode-interval-minutes'];
-            const xpDuration = options['xp-mode-duration-minutes'];
-            const minutesInBn = getTimeInBitnode() / 60.0 / 1000.0;
-            if (xpInterval > 0 && xpDuration > 0 && minutesInBn > xpInterval &&
-                ((minutesInBn + xpDuration) % (xpInterval + xpDuration)) <= xpDuration) {
-                daemonArgs.push("--xp-only", "--silent-misfires")
+            const xpInterval = Number(options['xp-mode-interval-minutes']);
+            const xpDuration = Number(options['xp-mode-duration-minutes']);
+            const minutesInAug = getTimeInAug() / 60.0 / 1000.0;
+            if (xpInterval > 0 && xpDuration > 0 && (minutesInAug % (xpInterval + xpDuration)) <= xpDuration) {
+                daemonArgs.push("--xp-only", "--silent-misfires", "--no-share")
                 if (!existingDaemon?.args.includes("--xp-only"))
                     daemonRelaunchMessage = `Relaunching daemon.js to focus on earning Hack Experience for ${xpDuration} minutes (--xp-mode-duration-minutes)`;
             } else if (existingDaemon?.args.includes("--xp-only")) {
@@ -468,7 +514,10 @@ async function checkOnRunningScripts(ns, player) {
     }
 
     // Launch (or re-launch) daemon if it is not already running with all our desired args - so long as stanek isn't charging
-    if (!stanekRunning && (!existingDaemon || daemonArgs.some(arg => !existingDaemon.args.includes(arg)))) {
+    let launchDaemon = !existingDaemon || daemonArgs.some(arg => !existingDaemon.args.includes(arg)) ||
+        // Special cases: We also must relaunch daemon if it is running with certain flags we wish to remove
+        (["--xp-only"].some(arg => !daemonArgs.includes(arg) && existingDaemon.args.includes(arg)))
+    if (!stanekRunning && launchDaemon) {
         if (existingDaemon) {
             daemonRelaunchMessage ??= `Relaunching daemon.js with new arguments since the current instance doesn't include all the args we want.`;
             log(ns, daemonRelaunchMessage);
@@ -512,11 +561,6 @@ async function checkOnRunningScripts(ns, player) {
         // If we're trying to rush gangs, run in such a way that we will spend most of our time doing crime, reducing Karma (also okay early income)
         // NOTE: Default work-for-factions behaviour is to spend hashes on coding contracts, which suits us fine
         launchScriptHelper(ns, 'work-for-factions.js', rushGang ? rushGangsArgs : workForFactionsArgs);
-    }
-
-    // Launch go.js. If we have SF14.2 or higher, we can use the cheats API
-    if (!options['disable-go'] && !findScript('go.js') && homeRam >= 64) {
-        launchScriptHelper(ns, 'go.js', ['--silent']);
     }
 }
 

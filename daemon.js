@@ -76,6 +76,8 @@ const unadjustedGrowthRate = 1.03;
 const maxGrowthRate = 1.0035;
 // The name given to purchased servers (should match what's in host-manager.js)
 const purchasedServersName = "daemon";
+// The name of the server to try running scripts on if home RAM is <= 16GB (early BN1)
+const backupServerName = 'harakiri-sushi';
 
 // The maximum current total RAM utilization before we stop attempting to schedule work for the next less profitable server. Can be used to reserve capacity.
 const maxUtilization = 0.95;
@@ -103,6 +105,7 @@ let homeReservedRam = 0; // (Set in command line args)
 
 let allHostNames = (/**@returns {string[]}*/() => [])(); // simple name array of servers that have been discovered
 let _allServers = (/**@returns{Server[]}*/() => [])(); // Array of Server objects - our internal model of servers for hacking
+let homeServer = (/**@returns{Server}*/() => [])(); // Quick access to the home server object.
 // Lists of tools (external scripts) run
 let hackTools, asynchronousHelpers, periodicScripts;
 // toolkit var for remembering the names and costs of the scripts we use the most
@@ -189,10 +192,19 @@ function processList(ns, serverName, canUseCache = true) {
     return processList;
 }
 
-// Returns the amount of money we should currently be reserving. Dynamically adapts to save money for a couple of big purchases on the horizon
+/** Get the players own money
+ * @param {NS} ns
+ * @returns {number} */
+function getPlayerMoney(ns) {
+    return ns.getServerMoneyAvailable("home");
+}
+
+/** Returns the amount of money we should currently be reserving. Dynamically adapts to save money for a couple of big purchases on the horizon
+ * @param {NS} ns
+ * @returns {number} */
 function reservedMoney(ns) {
     let shouldReserve = Number(ns.read("reserve.txt") || 0);
-    let playerMoney = ns.getServerMoneyAvailable("home");
+    let playerMoney = getPlayerMoney(ns);
     if (!ownedCracks.includes("SQLInject.exe") && playerMoney > 200e6)
         shouldReserve += 250e6; // Start saving at 200m of the 250m required for SQLInject
     const fourSigmaCost = (bitNodeMults.FourSigmaMarketDataApiCost * 25000000000);
@@ -204,13 +216,22 @@ function reservedMoney(ns) {
 // script entry point
 /** @param {NS} ns **/
 export async function main(ns) {
+    try {
+        await startup(ns);
+    } catch (err) {
+        log(ns, `ERROR: daemon.js Caught a fatal error during startup: ${getErrorInfo(err)}`, true, 'error');
+    }
+}
+
+/** @param {NS} ns **/
+async function startup(ns) {
     daemonHost = "home"; // ns.getHostname(); // get the name of this node (realistically, will always be home)
     const runOptions = getConfiguration(ns, argsSchema);
     if (!runOptions) return;
 
     // Ensure no other copies of this script are running (they share memory)
     const scriptName = ns.getScriptName();
-    const competingDaemons = processList(ns, "home", false /* Important! Don't use the (global shared) cache. */)
+    const competingDaemons = processList(ns, daemonHost, false /* Important! Don't use the (global shared) cache. */)
         .filter(s => s.filename == scriptName && s.pid != ns.pid);
     if (competingDaemons.length > 0) { // We expect only 1, due to this logic, but just in case, generalize the code below to support multiple.
         const daemonPids = competingDaemons.map(p => p.pid);
@@ -227,7 +248,7 @@ export async function main(ns) {
     lastUpdateTime = Date.now();
     maxTargets = 2;
     lowUtilizationIterations = highUtilizationIterations = 0;
-    allHostNames = [], _allServers = [];
+    allHostNames = [], _allServers = [], homeServer = null;
     resetServerSortCache();
     ownedCracks = [];
     // XpMode Related Caches
@@ -288,19 +309,26 @@ export async function main(ns) {
         if (recoveryThreadPadding == 1) recoveryThreadPadding = 10;
         if (stockMode) stockFocus = true; // Need to actively kill scripts that go against stock because they will live forever
     }
+    if (xpOnly && !options['no-share']) {
+        options['no-share'] = true;
+        log(ns, '--no-share has been implied by -x (--xp-only)');
+    }
 
     // These scripts are started once and expected to run forever (or terminate themselves when no longer needed)
     const openTailWindows = !options['no-tail-windows'];
 
     await establishMultipliers(ns); // figure out the various bitNode and player multipliers
 
-    const reqRam = (ram) => ns.getServerMaxRam("home") >= ram; // To avoid wasting precious RAM, many scripts don't launch unless we have more than a certain amount
+    // ASYNCHRONOUS HELPERS
+    // Set up "asynchronous helpers" - standalone scripts to manage certain aspacts of the game. daemon.js launches each of these once when ready (but not again if they are shut down)
+    const reqRam = (ram) => homeServer.totalRam(/*ignoreReservedRam:*/true) >= ram; // To avoid wasting precious RAM, many scripts don't launch unless we have more than a certain amount
     asynchronousHelpers = [
-        { name: "stats.js", shouldRun: () => reqRam(64) }, // Adds stats not usually in the HUD
+        { name: "stats.js", shouldRun: () => reqRam(64) }, // Adds stats not usually in the HUD (nice to have)
+        { name: "go.js", shouldRun: () => reqRam(32), minRamReq: 20.2, args: openTailWindows ? [] : ['--silent'] }, // Play go.js (various multipliers, but large dynamic ram requirements)
         { name: "stockmaster.js", shouldRun: () => reqRam(64), args: openTailWindows ? ["--show-market-summary"] : [], tail: openTailWindows }, // Start our stockmaster
-        { name: "hacknet-upgrade-manager.js", shouldRun: () => reqRam(64), args: ["-c", "--max-payoff-time", "1h"] }, // Kickstart hash income by buying everything with up to 1h payoff time immediately
+        { name: "hacknet-upgrade-manager.js", shouldRun: () => reqRam(32), args: ["-c", "--max-payoff-time", "1h"] }, // One-time kickstart of hash income by buying everything with up to 1h payoff time immediately
         { name: "spend-hacknet-hashes.js", args: [], shouldRun: () => reqRam(64) && 9 in dictSourceFiles }, // Always have this running to make sure hashes aren't wasted
-        { name: "sleeve.js", tail: openTailWindows, shouldRun: () => 10 in dictSourceFiles }, // Script to create manage our sleeves for us
+        { name: "sleeve.js", tail: openTailWindows, shouldRun: () => reqRam(64) && 10 in dictSourceFiles }, // Script to create manage our sleeves for us
         { name: "gangs.js", tail: openTailWindows, shouldRun: () => reqRam(64) && 2 in dictSourceFiles }, // Script to create manage our gang for us
         {
             name: "work-for-factions.js", args: ['--fast-crimes-only', '--no-coding-contracts'],  // Singularity script to manage how we use our "focus" work.
@@ -308,41 +336,47 @@ export async function main(ns) {
         },
         {   // Script to manage bladeburner for us. Run automatically if not disabled and bladeburner API is available
             name: "bladeburner.js", tail: openTailWindows,
-            shouldRun: () => !options['disable-script'].includes('bladeburner.js') && 7 in dictSourceFiles && !isInBn8
+            shouldRun: () => !options['disable-script'].includes('bladeburner.js') && reqRam(64) && 7 in dictSourceFiles && !isInBn8
         },
     ];
+
+    // Fix the file path for each tool if this script was cloned to a sub-directory
     asynchronousHelpers.forEach(helper => helper.name = getFilePath(helper.name));
     // Add any additional scripts to be run provided by --run-script arguments
     options['run-script'].forEach(s => asynchronousHelpers.push({ name: s }));
+    // Set these helper functions to not be marked as "temporary" when they are run (save their execution state)
+    asynchronousHelpers.forEach(helper => helper.runOptions = { temporary: false });
     asynchronousHelpers.forEach(helper => helper.isLaunched = false);
-    asynchronousHelpers.forEach(helper => helper.requiredServer = "home"); // All helpers should be launched at home since they use tempory scripts, and we only reserve ram on home
+    asynchronousHelpers.forEach(helper => helper.ignoreReservedRam = true);
+
+    // PERIODIC SCRIPTS
     // These scripts are spawned periodically (at some interval) to do their checks, with an optional condition that limits when they should be spawned
-    let shouldUpgradeHacknet = async () => ((await whichServerIsRunning(ns, "hacknet-upgrade-manager.js", false)) === null) && reservedMoney(ns) < ns.getServerMoneyAvailable("home");
+    let shouldUpgradeHacknet = async () => ((await whichServerIsRunning(ns, "hacknet-upgrade-manager.js", false)) === null) && reservedMoney(ns) < getPlayerMoney(ns);
     // In BN8 (stocks-only bn) and others with hack income disabled, don't waste money on improving hacking infrastructure unless we have plenty of money to spare
-    let shouldImproveHacking = () => bitNodeMults.ScriptHackMoneyGain != 0 && !isInBn8 || ns.getServerMoneyAvailable("home") > 1e12;
+    let shouldImproveHacking = () => bitNodeMults.ScriptHackMoneyGain != 0 && !isInBn8 || getPlayerMoney(ns) > 1e12;
     // Note: Periodic script are generally run every 30 seconds, but intervals are spaced out to ensure they aren't all bursting into temporary RAM at the same time.
     periodicScripts = [
         // Buy tor as soon as we can if we haven't already, and all the port crackers (exception: don't buy 2 most expensive port crackers until later if in a no-hack BN)
         { interval: 25000, name: "/Tasks/tor-manager.js", shouldRun: () => 4 in dictSourceFiles && !allHostNames.includes("darkweb") },
         { interval: 26000, name: "/Tasks/program-manager.js", shouldRun: () => 4 in dictSourceFiles && ownedCracks.length != 5 },
-        { interval: 27000, name: "/Tasks/contractor.js", requiredServer: "home" }, // Periodically look for coding contracts that need solving
+        { interval: 27000, name: "/Tasks/contractor.js", minRamReq: 14.2 }, // Periodically look for coding contracts that need solving
         // Buy every hacknet upgrade with up to 4h payoff if it is less than 10% of our current money or 8h if it is less than 1% of our current money.
-        { interval: 28000, name: "hacknet-upgrade-manager.js", shouldRun: shouldUpgradeHacknet, args: () => ["-c", "--max-payoff-time", "4h", "--max-spend", ns.getServerMoneyAvailable("home") * 0.1] },
-        { interval: 28500, name: "hacknet-upgrade-manager.js", shouldRun: shouldUpgradeHacknet, args: () => ["-c", "--max-payoff-time", "8h", "--max-spend", ns.getServerMoneyAvailable("home") * 0.01] },
+        { interval: 28000, name: "hacknet-upgrade-manager.js", shouldRun: shouldUpgradeHacknet, args: () => ["-c", "--max-payoff-time", "4h", "--max-spend", getPlayerMoney(ns) * 0.1] },
+        { interval: 28500, name: "hacknet-upgrade-manager.js", shouldRun: shouldUpgradeHacknet, args: () => ["-c", "--max-payoff-time", "8h", "--max-spend", getPlayerMoney(ns) * 0.01] },
         // Buy upgrades regardless of payoff if they cost less than 0.1% of our money
-        { interval: 29000, name: "hacknet-upgrade-manager.js", shouldRun: shouldUpgradeHacknet, args: () => ["-c", "--max-payoff-time", "1E100h", "--max-spend", ns.getServerMoneyAvailable("home") * 0.001] },
+        { interval: 29000, name: "hacknet-upgrade-manager.js", shouldRun: shouldUpgradeHacknet, args: () => ["-c", "--max-payoff-time", "1E100h", "--max-spend", getPlayerMoney(ns) * 0.001] },
         {
             interval: 30000, name: "/Tasks/ram-manager.js", args: () => ['--budget', 0.5, '--reserve', reservedMoney(ns)], // Spend about 50% of un-reserved cash on home RAM upgrades (permanent) when they become available
             shouldRun: () => 4 in dictSourceFiles && shouldImproveHacking() // Only trigger if hack income is important
         },
         {   // Periodically check for new faction invites and join if deemed useful to be in that faction. Also determines how many augs we could afford if we installed right now
-            interval: 31000, name: "faction-manager.js", requiredServer: "home", args: ['--verbose', 'false'],
+            interval: 31000, name: "faction-manager.js", args: ['--verbose', 'false'],
             // Don't start auto-joining factions until we're holding 1 billion (so coding contracts returning money is probably less critical) or we've joined one already
-            shouldRun: () => 4 in dictSourceFiles && (_cachedPlayerInfo.factions.length > 0 || ns.getServerMoneyAvailable("home") > 1e9) &&
-                (ns.getServerMaxRam("home") >= 128 / (2 ** dictSourceFiles[4])) // Uses singularity functions, and higher SF4 levels result in lower RAM requirements
+            shouldRun: () => 4 in dictSourceFiles && (_cachedPlayerInfo.factions.length > 0 || getPlayerMoney(ns) > 1e9) &&
+                reqRam(128 / (2 ** dictSourceFiles[4])) // Uses singularity functions, and higher SF4 levels result in lower RAM requirements
         },
         {   // Periodically look to purchase new servers, but note that these are often not a great use of our money (hack income isn't everything) so we may hold-back.
-            interval: 32000, name: "host-manager.js", requiredServer: "home",
+            interval: 32000, name: "host-manager.js", minRamReq: 6.55,
             // Funky heuristic warning: I find that new players with fewer SF levels under their belt are obsessed with hack income from servers,
             // but established players end up finding auto-purchased hosts annoying - so now the % of money we spend shrinks as SF levels grow.
             args: () => ['--reserve-percent', Math.min(0.9, 0.1 * Object.values(dictSourceFiles).reduce((t, v) => t + v, 0)), '--absolute-reserve', reservedMoney(ns), '--utilization-trigger', '0'],
@@ -353,17 +387,22 @@ export async function main(ns) {
             }
         },
         // Check if any new servers can be backdoored. If there are many, this can eat up a lot of RAM, so make this the last script scheduled at startup.
-        { interval: 33000, name: "/Tasks/backdoor-all-servers.js", requiredServer: "home", shouldRun: () => 4 in dictSourceFiles },
+        { interval: 33000, name: "/Tasks/backdoor-all-servers.js", shouldRun: () => 4 in dictSourceFiles },
     ];
     periodicScripts.forEach(tool => tool.name = getFilePath(tool.name));
+    periodicScripts.forEach(tool => tool.ignoreReservedRam = true);
+    if (verbose) // In verbose mode, have periodic sripts persist their logs.
+        periodicScripts.forEach(tool => tool.runOptions = { temporary: false });
+    // HACK TOOLS (run with many threads)
     hackTools = [
         { name: "/Remote/weak-target.js", shortName: "weak", threadSpreadingAllowed: true },
-        { name: "/Remote/grow-target.js", shortName: "grow" },
-        { name: "/Remote/hack-target.js", shortName: "hack" },
+        { name: "/Remote/grow-target.js", shortName: "grow" }, // Don't want to split because of security hardening after each fire, reducing success chance of next chunk. Also, a minor reduction in gains due to loss of thread count in base money added before exponential growth.
+        { name: "/Remote/hack-target.js", shortName: "hack" }, // Don't want to split because of security hardening, as above.
         { name: "/Remote/manualhack-target.js", shortName: "manualhack" },
         { name: "/Remote/share.js", shortName: "share", threadSpreadingAllowed: true },
     ];
     hackTools.forEach(tool => tool.name = getFilePath(tool.name));
+    hackTools.forEach(tool => tool.ignoreReservedRam = false);
 
     await buildToolkit(ns, [...asynchronousHelpers, ...periodicScripts, ...hackTools]); // build toolkit
     const allServers = await getNsDataThroughFile(ns, 'scanAllServers(ns)');
@@ -372,18 +411,15 @@ export async function main(ns) {
 
     // If we ascended less than 10 minutes ago, start with some study and/or XP cycles to quickly restore hack XP
     const timeSinceLastAug = Date.now() - resetInfo.lastAugReset;
-    const shouldKickstartHackXp = (playerHackSkill() < 500 && timeSinceLastAug < 600000);
+    const shouldKickstartHackXp = (playerHackSkill() < 500 && timeSinceLastAug < 600000 && reqRam(16)); // RamReq ensures we don't attempt this in BN1.1
     studying = shouldKickstartHackXp ? true : false; // Flag will be used to prevent focus-stealing scripts from running until we're done studying.
 
-    // Start helper scripts and run periodic scripts for the first time to e.g. buy tor and any hack tools available to us (we will continue studying briefly while this happens)
-    await runStartupScripts(ns);
-    await runPeriodicScripts(ns);
-    if (shouldKickstartHackXp) await kickstartHackXp(ns);
-
-    // For early players, provide a hint to buy more home RAM asap:
-    if (!(4 in dictSourceFiles) && !reqRam(64))
-        log(ns, `HINT: Daemon.js can do more if you have more Home Ram. ` +
-            `Head to [alpha ent.] and purchase at 64 GB as soon as possible!`, true, 'info');
+    if (shouldKickstartHackXp) {
+        // Start helper scripts and run periodic scripts for the first time to e.g. buy tor and any hack tools available to us (we will continue studying briefly while this happens)
+        await runStartupScripts(ns);
+        await runPeriodicScripts(ns);
+        await kickstartHackXp(ns);
+    }
 
     // Start the main targetting loop
     await doTargetingLoop(ns);
@@ -401,7 +437,7 @@ async function kickstartHackXp(ns) {
             try {
                 const studyTime = options['initial-study-time'];
                 log(ns, `INFO: Studying for ${studyTime} seconds to kickstart hack XP and speed up initial cycle times. (set --initial-study-time 0 to disable this step.)`);
-                const money = ns.getServerMoneyAvailable("home")
+                const money = getPlayerMoney(ns)
                 const { CityName, LocationName, UniversityClassType } = ns.enums
                 if (money >= 200000) { // If we can afford to travel, we're probably far enough along that it's worthwhile going to Volhaven where ZB university is.
                     log(ns, `INFO: Travelling to Volhaven for best study XP gain rate.`);
@@ -496,11 +532,17 @@ async function runPeriodicScripts(ns) {
         }
     }
     // Super-early aug, if we are poor, spend hashes as soon as we get them for a quick cash injection. (Only applies if we have hacknet servers)
-    if (9 in dictSourceFiles && !options['disable-spend-hashes'] // See if we have a hacknet, and spending hashes for money isn't disabled
-        && ns.getServerMoneyAvailable("home") < options['spend-hashes-for-money-when-under'] // Only if money is below the configured threshold
-        && (ns.getServerMaxRam("home") - ns.getServerUsedRam("home")) >= 5.6) { // Ensure we have spare RAM to run this temp script
-        await runCommand(ns, `0; if(ns.hacknet.spendHashes("Sell for Money")) ns.toast('Sold 4 hashes for \$1M', 'success')`, '/Temp/sell-hashes-for-money.js');
+    if (9 in dictSourceFiles && !options['disable-spend-hashes']) { // See if we have a hacknet, and spending hashes for money isn't disabled
+        if (homeServer.getMoney() < options['spend-hashes-for-money-when-under'] // Only if money is below the configured threshold
+            && homeServer.ramAvailable(/*ignoreReservedRam:*/true) >= 5.6) { // Ensure we have spare RAM to run this temp script
+            await runCommand(ns, `0; if(ns.hacknet.spendHashes("Sell for Money")) ns.toast('Sold 4 hashes for \$1M', 'success')`, '/Temp/sell-hashes-for-money.js');
+        }
     }
+    // For early players, provide a hint to buy more home RAM asap:
+    if (!(4 in dictSourceFiles) && !homeServer.totalRam(true) < 64)
+        log(ns, `INFO: Reminder: Daemon.js can do a lot more if you have more Home RAM. Right now, you must buy this yourself.` +
+            `\nHead to the "City", visit [alpha ent.] (or other Tech store), and purchase at least 64 GB as soon as possible!` +
+            `\nAlso be sure to purchase TOR and run "buy -a" from the terminal until you own all hack tools.`, true, 'info');
 }
 
 // Helper that gets the either invokes a function that returns a value, or returns the value as-is if it is not a function.
@@ -524,40 +566,52 @@ async function tryRunTool(ns, tool) {
         return true;
     }
     const args = funcResultOrValue(tool.args) || []; // Support either a static args array, or a function returning the args.
-    const runResult = await arbitraryExecution(ns, tool, 1, args, tool.requiredServer || "home");
+    const lowHomeRam = homeServer.totalRam(true) < 32; // Special-case. In early BN1.1, when home RAM is <32 GB, allow certain scripts to be run on any host
+    const runResult = lowHomeRam ? await arbitraryExecution(ns, tool, 1, args, backupServerName) :
+        await exec(ns, tool.name, daemonHost, tool.runOptions, ...args);
     if (runResult) {
         runningOnServer = await whichServerIsRunning(ns, tool.name, false);
-        if (verbose) log(ns, `Ran tool: ${tool.name} ` + (args.length > 0 ? `with args ${JSON.stringify(args)} ` : '') + (runningOnServer ? `on server ${runningOnServer}.` : 'but it shut down right away.'));
+        if (verbose)
+            log(ns, `Ran tool: ${tool.name} ` + (args.length > 0 ? `with args ${JSON.stringify(args)} ` : '') +
+                (runningOnServer ? `on server ${runningOnServer}.` : 'but it shut down right away.'));
         if (tool.tail === true && runningOnServer) {
             log(ns, `Tailing Tool: ${tool.name} on server ${runningOnServer}` + (args.length > 0 ? ` with args ${JSON.stringify(args)}` : ''));
             ns.tail(tool.name, runningOnServer, ...args);
             //tool.tail = false; // Avoid popping open additional tail windows in the future
         }
         return true;
-    } else
-        log(ns, `WARNING: Tool cannot be run (insufficient RAM? REQ: ${formatRam(tool.cost)} FREE: ${formatRam(ns.getServerMaxRam("home") - ns.getServerUsedRam("home"))}): ${tool.name}`, false, 'warning');
+    } else {
+        const errHost = getServerByName(daemonHost);
+        log(ns, `WARN: Tool could not be run on ${lowHomeRam ? "any host" : errHost} at this time (likely due to insufficient RAM. Requires: ${formatRam(tool.cost)} ` +
+            (lowHomeRam ? '' : `FREE: ${formatRam(errHost.ramAvailable(/*ignoreReservedRam:*/true))})`) + `: ${tool.name} [${args}]`, false, lowHomeRam ? undefined : 'warning');
+    }
     return false;
 }
 
-/** Workaround a current bitburner bug by yeilding briefly to the game after executing something.
+/** Wrapper for ns.exec which automatically retries if there is a failure.
  * @param {NS} ns
- * @param {String} script - Filename of script to execute.
- * @param {int} host - Hostname of the target server on which to execute the script.
- * @param {int} numThreads - Optional thread count for new script. Set to 1 by default. Will be rounded to nearest integer.
- * @param args - Additional arguments to pass into the new script that is being run. Note that if any arguments are being passed into the new script, then the third argument numThreads must be filled in with a value.
+ * @param {string} script - Filename of script to execute.
+ * @param {string?} hostname - Hostname of the target server on which to execute the script.
+ * @param {number|RunOptions?} numThreadsOrOptions - Optional thread count or RunOptions. Default is { threads: 1, temporary: true }
+ * @param {any} args - Additional arguments to pass into the new script that is being run. Note that if any arguments are being passed into the new script, then the third argument numThreads must be filled in with a value.
  * @returns — Returns the PID of a successfully started script, and 0 otherwise.
  * Workaround a current bitburner bug by yeilding briefly to the game after executing something. **/
-async function exec(ns, script, host, numThreads, ...args) {
-    // Try to run the script with auto-retry if it fails to start
+async function exec(ns, script, hostname = null, numThreadsOrOptions = null, ...args) {
+    // Defaults
+    hostname ??= daemonHost;
+    numThreadsOrOptions ??= { threads: 1, temporary: true };
+    let fnRunScript = () => ns.exec(script, hostname, numThreadsOrOptions, ...args);
+    // Wrap the script execution in an auto-retry if it fails to start
     // It doesn't make sense to auto-retry hack tools, only add error handling to other scripts
     if (hackTools.some(h => h.name === script))
-        return ns.exec(script, host, numThreads, ...args);
+        return fnRunScript();
     // Otherwise, run with auto-retry to handle e.g. temporary ram issues
+    let p;
     const pid = await autoRetry(ns, async () => {
-        const p = ns.exec(script, host, numThreads, ...args)
+        p = fnRunScript();
         return p;
-    }, p => p !== 0, () => new Error(`Failed to exec ${script} on ${host} with ${numThreads} threads. ` +
-        `This is likely due to having insufficient RAM. Args were: [${args}]`),
+    }, p => p !== 0, () => new Error(`Failed to exec ${script} on ${hostname}. ` +
+        `This is likely due to having insufficient RAM.\nArgs were: [${args}]`),
         undefined, undefined, undefined, verbose, verbose);
     return pid; // Caller is responsible for handling errors if final pid returned is 0 (indicating failure)
 }
@@ -567,7 +621,7 @@ async function exec(ns, script, host, numThreads, ...args) {
  * Execute an external script that roots a server, and wait for it to complete. **/
 async function doRoot(ns, server) {
     if (verbose) log(ns, `Rooting Server ${server.name}`);
-    const pid = await exec(ns, getFilePath('/Tasks/crack-host.js'), daemonHost, 1, server.name);
+    const pid = await exec(ns, getFilePath('/Tasks/crack-host.js'), daemonHost, { temporary: true }, server.name);
     await waitForProcessToComplete_Custom(ns, getHomeProcIsAlive(ns), pid);
     server.resetCaches(); // If rooted status was cached, we must now reset it
 }
@@ -589,9 +643,8 @@ async function doTargetingLoop(ns) {
             await getPlayerInfo(ns); // Force an update of _cachedPlayerInfo
             // Run some auxilliary processes that ease the ram burden of this daemon and add additional functionality (like managing hacknet or buying servers)
             await runPeriodicScripts(ns);
-            if (stockMode) await updateStockPositions(ns); // In stock market manipulation mode, get our current position in all stocks
-            let targetingOrder = await getAllServersByTargetOrder();
-            if (xpOnly) targetingOrder = targetsByExp.concat(...targetingOrder.filter(t => !targetsByExp.includes(t)));
+            if (stockMode) await updateStockPositions(ns); // In stock market manipulation mode, get our current position in all stocks, as it affects targetting order
+            let targetingOrder = await getAllServersByTargetOrder(); // Sort the targets in the order we should prioritize spending RAM on them
 
             if (loops % 60 == 0) { // For more expensive updates, only do these every so often
                 // If we have not yet launched all helpers (e.g. awaiting more home ram, or TIX API to be purchased) see if any are now ready to be run
@@ -599,7 +652,7 @@ async function doTargetingLoop(ns) {
                 // Pull additional data about servers that infrequently changes
                 await refreshDynamicServerData(ns, allHostNames);
                 // Occassionally print our current targetting order (todo, make this controllable with a flag or custom UI?)
-                if (verbose && loops % 600 == 0) {
+                if (verbose || loops % 600 == 0) {
                     const targetsLog = 'Targetting Order:\n  ' + targetingOrder.filter(s => s.shouldHack()).map(s =>
                         `${s.isPrepped() ? '*' : ' '} ${s.canHack() ? '✓' : 'X'} Money: ${formatMoney(s.getMoney(), 4)} of ${formatMoney(s.getMaxMoney(), 4)} ` +
                         `(${formatMoney(s.getMoneyPerRamSecond(), 4)}/ram.sec), Sec: ${formatNumber(s.getSecurity(), 3)} of ${formatNumber(s.getMinSecurity(), 3)}, ` +
@@ -744,7 +797,7 @@ async function doTargetingLoop(ns) {
             let intervalsPerTargetCycle = targeting.length == 0 ? 120 :
                 Math.ceil((targeting.reduce((max, t) => Math.max(max, t.timeToWeaken()), 0) + cycleTimingDelay) / loopInterval);
             //log(ns, `intervalsPerTargetCycle: ${intervalsPerTargetCycle} lowUtilizationIterations: ${lowUtilizationIterations} loopInterval: ${loopInterval}`);
-            if (lowUtilizationIterations > intervalsPerTargetCycle && skipped.length > 0) {
+            if (lowUtilizationIterations > intervalsPerTargetCycle && skipped.length > 0 && maxTargets < (targetingOrder.length - noMoney.length)) {
                 maxTargets++;
                 log(ns, `Increased max targets to ${maxTargets} since utilization (${formatNumber(utilizationPercent * 100, 3)}%) has been quite low for ${lowUtilizationIterations} iterations.`);
                 lowUtilizationIterations = 0; // Reset the counter of low-utilization iterations
@@ -821,7 +874,7 @@ async function doTargetingLoop(ns) {
             //log(ns, 'Prepping: ' + prepping.map(s => s.name).join(', '))
             //log(ns, 'targeting: ' + targeting.map(s => s.name).join(', '))
         } catch (err) {
-            // Sometimes a script is shut down by throwing an object contianing internal game script info. Detect this and exit silently
+            // Sometimes a script is shut down by throwing an object containing internal game script info. Detect this and exit silently
             if (err?.env?.stopFlag) return;
             log(ns, `WARNING: daemon.js Caught an error in the targeting loop: ${getErrorInfo(err)}`, true, 'warning');
             continue;
@@ -843,18 +896,20 @@ let dictServerRequiredHackinglevels = (/**@returns{{[serverName: string]: number
 let dictServerNumPortsRequired = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
 let dictServerMinSecurityLevels = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
 let dictServerMaxMoney = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
+let dictServerMaxRam = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
 let dictServerProfitInfo = (/**@returns{{[serverName: string]: {gainRate: number, expRate: number}}}*/() => undefined)();
 let dictServerGrowths = (/**@returns{{[serverName: string]: number;}}*/() => undefined)();
 
 /** Gathers up arrays of server data via external request to have the data written to disk.
  * @param {NS} ns */
 async function getStaticServerData(ns, serverNames) {
+    if (verbose) log(ns, "getStaticServerData");
     dictServerRequiredHackinglevels = await getServersDict(ns, 'getServerRequiredHackingLevel', serverNames);
     dictServerNumPortsRequired = await getServersDict(ns, 'getServerNumPortsRequired', serverNames);
     dictServerGrowths = await getServersDict(ns, 'getServerGrowth', serverNames);
     // The "GetServer" object result is now required to use the formulas API (due to type checking that the parameter is a valid "server" instance)
     // TODO: See if in the future they add a "ns.formulas.standInServer()" function or similar, then we no longer need this.
-    // TODO: Iff this becomes permanent, might as well get other static server data from the resulting server objectswhy is it that every keystroke
+    // TODO: Iff this becomes permanent, might as well get other static server data from the resulting server objects
     dictInitialServerInfos = await getServersDict(ns, 'getServer', serverNames);
     await refreshDynamicServerData(ns, serverNames);
 }
@@ -866,8 +921,10 @@ async function refreshDynamicServerData(ns, serverNames) {
     // Min Security / Max Money can be affected by Hashnet purchases, so we should update this occasionally
     dictServerMinSecurityLevels = await getServersDict(ns, 'getServerMinSecurityLevel', serverNames);
     dictServerMaxMoney = await getServersDict(ns, 'getServerMaxMoney', serverNames);
+    // Max ram is mostly static, but can grow upon purchases, so update this only occasionally
+    dictServerMaxRam = await getServersDict(ns, 'getServerMaxRam', serverNames);
     // Get the information about the relative profitability of each server (affects targetting order)
-    const pid = await exec(ns, getFilePath('analyze-hack.js'), daemonHost, 1, '--all', '--silent');
+    const pid = await exec(ns, getFilePath('analyze-hack.js'), null, null, '--all', '--silent');
     await waitForProcessToComplete_Custom(ns, getHomeProcIsAlive(ns), pid);
     const analyzeHackResult = dictServerProfitInfo = ns.read('/Temp/analyze-hack.txt');
     if (!analyzeHackResult)
@@ -1035,14 +1092,17 @@ class Server {
     }
     hasRoot() { return this._hasRootCached ??= this.ns.hasRootAccess(this.name); }
     isHost() { return this.name == daemonHost; }
-    totalRam() {
-        let maxRam = this.ns.getServerMaxRam(this.name);
-        if (this.name == "home")
-            maxRam = Math.max(0, maxRam - homeReservedRam); // Complete HACK: but for most planning purposes, we want to pretend home has less ram to leave room for temp scripts to run
+    totalRam(ignoreReservedRam = false) {
+        let maxRam = dictServerMaxRam[this.name]; // Use a cached max ram amount to save time.
+        if (maxRam == null) throw new Error(`Dictionary of servers' max ram was missing information for ${this.name}`);
+        // Complete HACK: but for most planning purposes, we want to pretend home has less ram to leave room for temp scripts to run
+        if (!ignoreReservedRam && (this.name == "home" ||
+            (this.name == backupServerName && dictServerMaxRam["home"] <= 16))) // Double-hack: When home RAM sucks (start of BN 1.1) reserve a server for helpers.
+            maxRam = Math.max(0, maxRam - homeReservedRam);
         return maxRam;
     }
     usedRam() { return this.ns.getServerUsedRam(this.name); }
-    ramAvailable() { return this.totalRam() - this.usedRam(); }
+    ramAvailable(ignoreReservedRam = false) { return this.totalRam(ignoreReservedRam) - this.usedRam(); }
     growDelay() { return this.timeToWeaken() - this.timeToGrow() + cycleTimingDelay; }
     hackDelay() { return this.timeToWeaken() - this.timeToHack(); }
     timeToWeaken() { return this.ns.getWeakenTime(this.name); }
@@ -1370,25 +1430,26 @@ function getScheduleItem(description, toolShortName, start, end, threadsNeeded) 
  * @param {Tool} tool - An object representing the script being executed **/
 export async function arbitraryExecution(ns, tool, threads, args, preferredServerName = null, useSmallestServerPossible = false, allowThreadSplitting = null) {
     // We will be using the list of servers that is sorted by most available ram
-    var rootedServersByFreeRam = getAllServersByFreeRam().filter(server => server.hasRoot() && server.totalRam() > 1.6 || server.name == "home");
+    const igRes = tool.ignoreReservedRam; // Whether this tool ignores "reserved ram"
+    const rootedServersByFreeRam = getAllServersByFreeRam().filter(server => server.hasRoot() && server.totalRam(igRes) > 1.6);
     // Sort servers by total ram, and try to fill these before utilizing another server.
-    var preferredServerOrder = getAllServersByMaxRam().filter(server => server.hasRoot() && server.totalRam() > 1.6 || server.name == "home");
+    const preferredServerOrder = getAllServersByMaxRam().filter(server => server.hasRoot() && server.totalRam(igRes) > 1.6);
     if (useSmallestServerPossible) // If so-configured, fill up small servers before utilizing larger ones (can be laggy)
         preferredServerOrder.reverse();
     // IDEA: "home" is more effective at grow() and weaken() than other nodes (has multiple cores) (TODO: By how much?)
     //       so if this is one of those tools, put it at the front of the list of preferred candidates, otherwise keep home ram free if possible
     //       TODO: This effort is wasted unless we also scale down the number of threads "needed" when running on home. We will overshoot grow/weaken
-    var home = preferredServerOrder.splice(preferredServerOrder.findIndex(i => i.name == "home"), 1)[0];
+    const home = preferredServerOrder.splice(preferredServerOrder.findIndex(i => i.name == "home"), 1)[0];
     if (tool.shortName == "grow" || tool.shortName == "weak" || preferredServerName == "home")
         preferredServerOrder.unshift(home); // Send to front
     else
         preferredServerOrder.push(home); // Otherwise, send it to the back (reserve home for scripts that benefit from cores) and use only if there's no room on any other server.
     // Push all "hacknet servers" to the end of the preferred list, since they will lose productivity if used
-    var anyHacknetNodes = [];
+    const anyHacknetNodes = [];
     let hnNodeIndex;
     while (-1 !== (hnNodeIndex = preferredServerOrder.indexOf(s => s.name.startsWith('hacknet-server-') || s.name.startsWith('hacknet-node-'))))
-        anyHacknetNodes.push(preferredServerOrder.splice(hnNodeIndex, 1));
-    preferredServerOrder.push(...anyHacknetNodes.sort((a, b) => b.totalRam != a.totalRam ? b.totalRam - a.totalRam : a.name.localeCompare(b.name)));
+        anyHacknetNodes.push(...preferredServerOrder.splice(hnNodeIndex, 1));
+    preferredServerOrder.push(...anyHacknetNodes.sort((a, b) => b.totalRam(igRes) != a.totalRam(igRes) ? b.totalRam(igRes) - a.totalRam(igRes) : a.name.localeCompare(b.name)));
 
     // Allow for an overriding "preferred" server to be used in the arguments, and slot it to the front regardless of the above
     if (preferredServerName && preferredServerName != "home" /*home is handled above*/) {
@@ -1398,17 +1459,12 @@ export async function arbitraryExecution(ns, tool, threads, args, preferredServe
         else
             log(ns, `ERROR: Configured preferred server "${preferredServerName}" for ${tool.name} is not a valid server name`, true, 'error');
     }
-    //log(ns, `Preferred Server ${preferredServerName} for ${tool.name} resulted in preferred order: ${preferredServerOrder.map(srv => srv.name)}`);
-    //log(ns, `Servers by free ram: ${rootedServersByFreeRam.map(svr => svr.name + " (" + svr.ramAvailable() + ")")}`);
+    if (verbose) log(ns, `Preferred Server ${preferredServerName} for ${threads} threads of ${tool.name} resulted in preferred order:${preferredServerOrder.map(s => ` ${s.name} (${formatRam(s.ramAvailable(igRes))})`)}`);
 
     // Helper function to compute the most threads a server can run
-    let computeMaxThreads = function (server) {
+    let computeMaxThreads = /** @param {Server} server */ function (server) {
         if (tool.cost == 0) return 1;
-        let ramAvailable = server.ramAvailable();
-        // It's a hack, but we know that "home"'s reported ram available is lowered to leave room for "preferred" jobs,
-        // so if this is a preferred job, ignore what the server object says and get it from the source
-        if (server.name == "home" && preferredServerName == "home")
-            ramAvailable = ns.getServerMaxRam("home") - ns.getServerUsedRam("home");
+        let ramAvailable = server.ramAvailable(igRes);
         // Note: To be conservative, we allow double imprecision to cause this floor() to return one less than should be possible,
         //       because the game likely doesn't account for this imprecision (e.g. let 1.9999999999999998 return 1 rather than 2)
         return Math.floor((ramAvailable / tool.cost)/*.toPrecision(14)*/);
@@ -1444,12 +1500,15 @@ export async function arbitraryExecution(ns, tool, threads, args, preferredServe
             let missing_scripts = [tool.name];
             if (!doesFileExist(ns, getFilePath('helpers.js'), targetServer.name))
                 missing_scripts.push(getFilePath('helpers.js')); // Some tools require helpers.js. Best to copy it around.
+            if (tool.name.includes("/Tasks/contractor.js")) // HACK: When home RAM is low and we're running this tool on another sever, copy its dependencies
+                missing_scripts.push(getFilePath('/Tasks/contractor.js.solver.js'), getFilePath('/Tasks/run-with-delay.js'))
             if (verbose)
                 log(ns, `Copying ${tool.name} from ${daemonHost} to ${targetServer.name} so that it can be executed remotely.`);
             await getNsDataThroughFile(ns, `ns.scp(ns.args.slice(2), ns.args[0], ns.args[1])`, '/Temp/copy-scripts.txt', [targetServer.name, daemonHost, ...missing_scripts])
             //await ns.sleep(5); // Workaround for Bitburner bug https://github.com/danielyxie/bitburner/issues/1714 - newly created/copied files sometimes need a bit more time, even if awaited
         }
-        let pid = await exec(ns, tool.name, targetServer.name, maxThreadsHere, ...(args || []));
+        // By default, tools executed in this way will be marked as "temporary" (not to be included in the save file or recent scripts history)
+        let pid = await exec(ns, tool.name, targetServer.name, { threads: maxThreadsHere, temporary: (tool.runOptions.temporary ?? true) }, ...(args || []));
         if (pid == 0) {
             log(ns, `ERROR: Failed to exec ${tool.name} on server ${targetServer.name} with ${maxThreadsHere} threads`, false, 'error');
             return false;
@@ -1458,16 +1517,17 @@ export async function arbitraryExecution(ns, tool, threads, args, preferredServe
         remainingThreads -= maxThreadsHere;
         if (remainingThreads > 0) {
             if (!(allowThreadSplitting || tool.isThreadSpreadingAllowed)) break;
-            // No need to warn if it's allowed? log(ns, `WARNING: Had to split ${threads} ${tool.name} threads across multiple servers. ${maxThreadsHere} on ${targetServer.name}`);
+            if (verbose) log(ns, `INFO: Had to split ${threads} ${tool.name} threads across multiple servers. ${maxThreadsHere} on ${targetServer.name}`);
             splitThreads = true;
         }
     }
     // The run failed if there were threads left to schedule after we exhausted our pool of servers
-    if (remainingThreads > 0 && threads < Number.MAX_SAFE_INTEGER)
-        log(ns, `ERROR: Ran out of RAM to run ${tool.name} on ${splitThreads ? 'all servers (split)' : `${targetServer?.name} `}- ` +
-            `${threads - remainingThreads} of ${threads} threads were spawned.`, false, 'error');
-    if (splitThreads && !tool.isThreadSpreadingAllowed)
-        return false;
+    if (remainingThreads > 0 && threads < Number.MAX_SAFE_INTEGER) {
+        const keepItQuiet = options['silent-misfires'] || homeServer.ramAvailable(true) <= 16; // Don't confuse new users with transient errors when first getting going
+        log(ns, `${keepItQuiet ? 'WARN' : 'ERROR'}: Ran out of RAM to run ${tool.name} on ${splitThreads ? 'all servers (split)' : `${targetServer?.name} `}- ` +
+            `${threads - remainingThreads} of ${threads} threads were spawned.`, false, keepItQuiet ? undefined : 'error');
+    }
+    // if (splitThreads && !tool.isThreadSpreadingAllowed) return false; // TODO: Don't think this is needed anymore. We allow overriding with "allowThreadSplitting" in some cases, doesn't mean this is an error
     return remainingThreads == 0;
 }
 
@@ -1483,22 +1543,29 @@ async function prepServer(ns, currentTarget) {
     // Note: We must prioritize weakening before growing, or hardened security will make everything take longer
     let weakenThreadsAllowable = weakenTool.getMaxThreads(); // Note: Max is based on total ram across all servers (since thread spreading is allowed)
     let weakenThreadsNeeded = currentTarget.getWeakenThreadsNeeded();
+    if (verbose) log(ns, `INFO: Need ${weakenThreadsNeeded} threads to weaken from ${currentTarget.getSecurity()} to ${currentTarget.getMinSecurity()}. There is room for ${weakenThreadsAllowable} threads (${currentTarget.name})`);
     // Plan grow if needed, but don't bother if we didn't have enough ram to schedule all weaken threads to reach min security
-    let growThreadsNeeded, growThreadsScheduled = 0;
+    let growThreadsAllowable, growThreadsNeeded, growThreadsScheduled = 0;
     if (weakenThreadsNeeded < weakenThreadsAllowable && (growThreadsNeeded = currentTarget.getGrowThreadsNeeded())) {
-        let growThreadsAllowable = growTool.getMaxThreads(true) - weakenThreadsNeeded; // Take into account RAM that will be consumed by weaken threads scheduled
-        growThreadsScheduled = Math.min(growThreadsAllowable, growThreadsNeeded);
+        // During the prep-phase only, we allow grow threads to be split, despite the risks of added security hardening, because in practice is speeds the prep phase along more than waiting for separate batches.
+        growThreadsAllowable = growTool.getMaxThreads(/*^*/ true /*^*/) - weakenThreadsNeeded; // Take into account RAM that will be consumed by weaken threads scheduled
+        growThreadsScheduled = Math.min(growThreadsNeeded, growThreadsAllowable - 1); // Cap at threads-1 because we assume we will need at least one of these threads for additional weaken recovery
+        if (verbose) log(ns, `INFO: Need ${growThreadsNeeded} threads to grow from ${currentTarget.getMoney()} to ${currentTarget.getMaxMoney()}. There is room for ${growThreadsAllowable} threads (${currentTarget.name})`);
         // Calculate additional weaken threads which should be fired after the grow completes.
         let weakenForGrowthThreadsNeeded = Math.ceil((growThreadsScheduled * growthThreadHardening / actualWeakenPotency()).toPrecision(14));
         // If we don't have enough room for the new weaken threads, release grow threads to make room
         const subscription = (growThreadsScheduled + weakenForGrowthThreadsNeeded) / growThreadsAllowable;
         if (subscription > 1) { // Scale down threads to schedule until we are no longer over-subscribed
-            log(ns, `INFO: Insufficient RAM to schedule all ${weakenForGrowthThreadsNeeded} required weaken threads to recover from ` +
-                `${growThreadsScheduled} prep grow threads. Scaling both down by ${subscription} (${currentTarget.name})`);
-            growThreadsScheduled = Math.floor((growThreadsScheduled / subscription).toPrecision(14));
-            weakenForGrowthThreadsNeeded = Math.floor((weakenForGrowthThreadsNeeded / subscription).toPrecision(14));
+            const scaleFactor = (growThreadsScheduled + weakenForGrowthThreadsNeeded + 1) / growThreadsAllowable; // +1 is because we will need to round weaken threads up, rather than down, to avoid under-recovery
+            const scaledGrowThreads = Math.floor((growThreadsScheduled / scaleFactor).toPrecision(14))
+            const scaledWeakThreads = Math.ceil((weakenForGrowthThreadsNeeded / scaleFactor).toPrecision(14));
+            log(ns, `INFO: Insufficient RAM to schedule ${weakenForGrowthThreadsNeeded} required weaken threads to recover from ${growThreadsScheduled} prep grow threads. ` +
+                `Scaling both down by ${scaleFactor} to ${scaledGrowThreads} grow + ${scaledWeakThreads} weaken (${currentTarget.name})`);
+            growThreadsScheduled = scaledGrowThreads;
+            weakenForGrowthThreadsNeeded = scaledWeakThreads;
         }
         weakenThreadsNeeded += weakenForGrowthThreadsNeeded;
+        growThreadsAllowable -= weakenForGrowthThreadsNeeded; // For purposes of logging this below if we fail to schedule all grow threads
     }
 
     // Schedule weaken first, in case ram conditions change, it's more important (security affects speed of future tools)
@@ -1512,7 +1579,7 @@ async function prepServer(ns, currentTarget) {
         prepSucceeding = await arbitraryExecution(ns, weakenTool, weakenThreadsScheduled,
             [currentTarget.name, now.getTime(), now.getTime(), 0, "prep", ...getFlagsArgs("weak", currentTarget.name, false)]);
         if (prepSucceeding == false)
-            log(ns, `Failed to schedule all ${weakenThreadsScheduled} prep weaken threads (${currentTarget.name})`);
+            log(ns, `WARN: Failed to schedule ${weakenThreadsScheduled} prep weaken threads despite there ostensibly being room for ${weakenThreadsAllowable} (${currentTarget.name})`);
     }
     // Schedule any prep grow threads next
     if (prepSucceeding && growThreadsScheduled > 0) {
@@ -1520,7 +1587,7 @@ async function prepServer(ns, currentTarget) {
             [currentTarget.name, now.getTime(), now.getTime(), 0, "prep", ...getFlagsArgs("grow", currentTarget.name, false)],
             undefined, undefined, /*allowThreadSplitting*/ true); // Special case: for prep we allow grow threads to be split
         if (prepSucceeding == false)
-            log(ns, `Failed to schedule all ${growThreadsScheduled} prep grow threads (${currentTarget.name})`);
+            log(ns, `WARN: Failed to schedule ${growThreadsScheduled} prep grow threads despite there ostensibly being room for ${growThreadsAllowable} (${currentTarget.name})`);
     }
 
     // Log a summary of what we did here today
@@ -1557,12 +1624,12 @@ async function farmHackXp(ns, fractionOfFreeRamToConsume = 1, verbose = false, n
     const serversByMaxRam = getAllServersByMaxRam();
     var jobHosts = serversByMaxRam.filter(s => s.hasRoot() && s.totalRam() > 128); // Get the set of servers that can be reasonably expected to host decent-sized jobs
     if (jobHosts.length == 0) jobHosts = serversByMaxRam.filter(s => s.hasRoot() && s.totalRam() > 16); // Lower our standards if we're early-game and nothing qualifies
-    var homeRam = Math.max(0, ns.getServerMaxRam("home") - homeReservedRam); // If home ram is large enough, the XP contributed by additional targets is insignificant compared to the risk of increased lag/latency.
+    var homeRam = homeServer.totalRam(); // If total home ram is large enough, the XP contributed by additional targets is insignificant compared to the risk of increased lag/latency.
     // Determine which servers to target for XP
     numTargets = Math.min(maxTargets, Math.floor(jobHosts.filter(s => s.totalRam() > 0.01 * homeRam).length)); // Limit targets (too many creates lag which worsens performance, and need a dedicated server for each)
     const newTargets = getXPFarmTargetsByExp();
     if (!loopingMode)
-        targetsByExp = newTargets; // Normally, we just take the latests Xp targetting order
+        targetsByExp = newTargets; // Normally, we just take the latests Xp targetting order (TODO: Perhaps cache this for a limited time (30 mins?) to keep the targetting order stable)
     else if (loopingMode && targetsByExp.length < numTargets) { // In looping mode, we must keep the target-host mapping stable, we only revisit if we have capacity for new targets
         targetsByExp = targetsByExp.concat(...(newTargets
             .filter(t => !targetsByExp.includes(t)) // Only take targets not already in the target list
@@ -1638,6 +1705,7 @@ async function scheduleHackExpCycle(ns, server, percentOfFreeRamToConsume, verbo
     const activeCycleTimeLeft = (eta || 0) - Date.now();
     if (activeCycleTimeLeft > 1000) return activeCycleTimeLeft; // If we're more than 1s away from the expected fire time, just wait for the next loop, don't even check for early completion
     if (farmXpReentryLock[server.name] == true) return; // Ensure more than one concurrent callback isn't trying to schedule this server's faming cycle
+    const [logPrefix, toastLevel] = options['silent-misfires'] ? ['INFO:', undefined] : ['WARNING:', 'warning'];
     try {
         farmXpReentryLock[server.name] = true;
         let expTool; // The tool we will use to farm XP (can be hack, grow, or weaken depending on the situation)
@@ -1658,14 +1726,14 @@ async function scheduleHackExpCycle(ns, server, percentOfFreeRamToConsume, verbo
         if (!loopRunning) {
             if (await server.isXpFarming()) {
                 if (verbose && activeCycleTimeLeft < -50) // Warn about big misfires (sign of lag)
-                    log(ns, `WARNING: ${server.name} FarmXP process is ` + (eta ? `more than ${formatDuration(-activeCycleTimeLeft)} overdue...` :
-                        `still in progress from a prior run. ETA unknown, assuming '${expTool.name}' time: ${formatDuration(expTime)}`));
+                    log(ns, `${logPrefix} ${server.name} FarmXP process is ` + (eta ? `more than ${formatDuration(-activeCycleTimeLeft)} overdue...` :
+                        `still in progress from a prior run. ETA unknown, assuming '${expTool.name}' time: ${formatDuration(expTime)}`), false, toastLevel);
                 return eta ? (activeCycleTimeLeft > 0 ? activeCycleTimeLeft : 10 /* If we're overdue, sleep only 10 ms before checking again */) : expTime /* Have no ETA, sleep for expTime */;
             }
             threads = Math.floor(((allocatedServer == null ? expTool.getMaxThreads() : allocatedServer.ramAvailable() / expTool.cost) * percentOfFreeRamToConsume).toPrecision(14));
             if (threads == 0)
-                return log(ns, `WARNING: Cannot farm XP from ${server.name}, threads == 0 for allocated server ` + (allocatedServer == null ? '(any server)' :
-                    `${allocatedServer.name} with ${formatRam(allocatedServer.ramAvailable())} free RAM`), false, 'warning');
+                return log(ns, `${logPrefix} Cannot farm XP from ${server.name}, threads == 0 for allocated server ` + (allocatedServer == null ? '(any server)' :
+                    `${allocatedServer.name} with ${formatRam(allocatedServer.ramAvailable())} free RAM`), false, toastLevel);
         }
 
         if (advancedMode) { // Need to keep server money above zero, and security at minimum to farm xp from hack();
@@ -1683,8 +1751,8 @@ async function scheduleHackExpCycle(ns, server, percentOfFreeRamToConsume, verbo
             if (singleServer) // If set to only use a single server, free up the hack threads to make room for recovery threads
                 threads = Math.max(0, threads - Math.ceil((growThreadsNeeded + weakenThreadsNeeded) * 1.75 / expTool.cost)); // Make room for recovery threads
             if (threads == 0)
-                return log(ns, `Cannot farm XP from ${server.name} on ` + (allocatedServer == null ? '(any server)' : `${allocatedServer.name} with ${formatRam(allocatedServer.ramAvailable())} free RAM`) +
-                    `: hack threads == 0 after releasing for ${growThreadsNeeded} grow threads and ${weakenThreadsNeeded} weaken threads for ${effectiveHackThreads} effective hack threads.`);
+                return log(ns, `${logPrefix} Cannot farm XP from ${server.name} on ` + (allocatedServer == null ? '(any server)' : `${allocatedServer.name} with ${formatRam(allocatedServer.ramAvailable())} free RAM`) +
+                    `: hack threads == 0 after releasing for ${growThreadsNeeded} grow threads and ${weakenThreadsNeeded} weaken threads for ${effectiveHackThreads} effective hack threads.`, false, toastLevel);
         }
 
         let scheduleDelay = 10; // Assume it will take this long a script fired immediately to start running
@@ -1821,6 +1889,8 @@ function addServer(ns, server, verbose) {
     if (verbose) log(ns, `Adding a new server to all lists: ${server}`);
     allHostNames.push(server.name);
     _allServers.push(server);
+    if (server.name == daemonHost)
+        homeServer = server;
     resetServerSortCache(); // Reset the cached sorted lists of objects
 }
 
@@ -1855,8 +1925,12 @@ async function buildServerList(ns, verbose = false, allServers = undefined) {
     for (const hostName of allHostNames.filter(hostName => !scanResult.includes(hostName)))
         removeServerByName(ns, hostName);
     // Add any servers that are new
-    for (const hostName of scanResult.filter(hostName => !allHostNames.includes(hostName)))
+    const newServers = scanResult.filter(hostName => !allHostNames.includes(hostName))
+    if (newServers.length == 0) return;
+    for (const hostName of newServers)
         addServer(ns, new Server(ns, hostName, verbose));
+    // Need to refresh static server info, since there are now new servers to gather information from
+    await getStaticServerData(ns, allHostNames);
 }
 
 /** @returns {Server[]} A list of all server objects */
@@ -1914,8 +1988,14 @@ async function getAllServersByTargetOrder() {
     for (const server of _serverListByTargetOrder)
         dictIsTargeting[server.name] = await server.isTargeting();
     return _sortServersAndReturn(_serverListByTargetOrder, function (a, b) {
-        // To ensure we establish some income, prep fastest-to-prep servers first, and target prepped servers before unprepped servers.
         if (a.canHack() != b.canHack()) return a.canHack() ? -1 : 1; // Sort all hackable servers first
+        // In xp-only mode, make the targeting order consist with the current cached "targetsByExp" order
+        if (xpOnly) {
+            let targetIdxA = targetsByExp.indexOf(a);
+            let targetIdxB = targetsByExp.indexOf(b);
+            if (targetIdxA != -1 || targetIdxB != -1) // If one or both are in the targetsByExp list, sort based on this
+                return targetIdxA == -1 ? 1 : targetIdxB == -1 ? -1 : targetIdxA < targetIdxB ? -1 : 1;
+        }
         if (stockFocus) { // If focused on stock-market manipulation, sort up servers with a stock, prioritizing those we have some position in
             let stkCmp = serversWithOwnedStock.includes(a.name) == serversWithOwnedStock.includes(b.name) ? 0 : serversWithOwnedStock.includes(a.name) ? -1 : 1;
             let manipA = (shouldManipulateGrow[a.name] || shouldManipulateHack[a.name]); // Whether we want to manipulate the stock associated with server A
@@ -1923,14 +2003,14 @@ async function getAllServersByTargetOrder() {
             if (stkCmp == 0) stkCmp = manipA == manipB ? 0 : manipA ? -1 : 1;
             if (stkCmp != 0) return stkCmp;
         }
-        // Next, Sort prepped servers to the front. Assume that if we're targetting, we're prepped (between cycles)
-        let aIsPrepped = (a.isPrepped() || dictIsTargeting[a.name]);
+        // Next, Sort already-prepped servers to the front (they can be hacked now)
+        let aIsPrepped = (a.isPrepped() || dictIsTargeting[a.name]); // Assume that if we're targetting a server, it's prepped
         let bIsPrepped = (b.isPrepped() || dictIsTargeting[b.name]);
         if (aIsPrepped != bIsPrepped) return aIsPrepped ? -1 : 1;
-        if (!a.canHack()) return a.requiredHackLevel - b.requiredHackLevel; // Unhackable servers are sorted by lowest hack requirement
+        if (!a.canHack()) return a.requiredHackLevel - b.requiredHackLevel; // Not-yet-hackable servers are sorted by lowest hack requirement (earliest unlock)
         //if (!a.isPrepped()) return a.timeToWeaken() - b.timeToWeaken(); // Unprepped servers are sorted by lowest time to weaken
         // For ready-to-hack servers, the sort order is based on money, RAM cost, and cycle time
-        let bestGains = b.getMoneyPerRamSecond() - a.getMoneyPerRamSecond(); // Prepped servers are sorted by most money/ram.second
+        let bestGains = b.getMoneyPerRamSecond() - a.getMoneyPerRamSecond(); // Groups of prepped and un-prepped servers are sorted by most money/ram.second
         if (bestGains != 0) return bestGains;
         // In the unlikely event that two servers have the same gains, sort them alphabetically to ensure a stable sort
         return a.name.localeCompare(b.name)
@@ -1957,7 +2037,7 @@ async function establishMultipliers(ns) {
 }
 
 class Tool {
-    /** @param {({name: string; shortName: string; shouldRun: () => Promise<boolean>; args: string[]; tail: boolean; requiredServer: string; threadSpreadingAllowed: boolean; })} toolConfig
+    /** @param {({name: string; shortName: string; shouldRun: () => Promise<boolean>; args: string[]; tail: boolean; threadSpreadingAllowed: boolean; ignoreReservedRam: boolean; minRamReq: number, runOptions: RunOptions; })} toolConfig
      * @param {Number} toolCost **/
     constructor(toolConfig, toolCost) {
         this.name = toolConfig.name;
@@ -1965,10 +2045,14 @@ class Tool {
         this.tail = toolConfig.tail || false;
         this.args = toolConfig.args || [];
         this.shouldRun = toolConfig.shouldRun;
-        this.requiredServer = toolConfig.requiredServer;
+        // If tools use ram-dodging, they can specify their "real" minimum ram requirement to run without errors on some host
+        this.cost = toolConfig.minRamReq ?? toolCost;
+        // "Reserved ram" is reserved for helper scripts and ram-dodging. Tools can specify whether or not they ignore reserved ram during execution.
+        this.ignoreReservedRam = toolConfig.ignoreReservedRam ?? false;
         // Whether, in general, it's save to spread threads for this tool around to different servers (overridden in some cases)
         this.isThreadSpreadingAllowed = toolConfig.threadSpreadingAllowed === true;
-        this.cost = toolCost;
+        // New option to control script RunOptions. By default, they are marked as temporary.
+        this.runOptions = toolConfig.runOptions ?? { temporary: true };
     }
     /** @param {Server} server
      * @returns {boolean} true if the server has this tool and enough ram to run it. */
@@ -1985,11 +2069,14 @@ class Tool {
         for (const server of getAllServersByFreeRam().filter(s => s.hasRoot())) {
             // Note: To be conservative, we allow double imprecision to cause this floor() to return one less than should be possible,
             //       because the game likely doesn't account for this imprecision (e.g. let 1.9999999999999998 return 1 rather than 2)
-            let threadsHere = Math.floor((server.ramAvailable() / this.cost) /*.toPrecision(14)*/);
-            // HACK: Temp script firing before the script gets scheduled can cause home ram reduction, don't promise as much from home
-            if (server.name == "home") // TODO: Revise this hack, it is technically messing further with the "servers by free ram" sort order
-                threadsHere = Math.max(0, threadsHere - Math.ceil(homeReservedRam / this.cost)); // Note: Effectively doubles home reserved RAM in cases where we plan to consume all available RAM
-            // TODO: Perhaps an alternative to the above is that the scheduler should not be so strict about home reserved ram enforcement if we use thread spreading and save scheduling on home for last?
+            let serverRamAvailable = server.ramAvailable(this.ignoreReservedRam);
+            // HACK: Temp script firing before the script gets scheduled can cause further available home ram reduction, don't promise as much from home
+            // TODO: Revise this hack, it is technically messing further with the "servers by free ram" sort order. Perhaps an alternative to this approach
+            //       is that the scheduler should not be so strict about home reserved ram enforcement if we use thread spreading and save scheduling on home for last?
+            if (server.name == "home" && !this.ignoreReservedRam)
+                serverRamAvailable -= homeReservedRam; // Note: Effectively doubles home reserved RAM in cases where we plan to consume all available RAM            
+            const threadsHere = Math.max(0, Math.floor(serverRamAvailable / this.cost));
+            //log(server.ns, `INFO: Can fit ${threadsHere} threads of ${this.shortName} on ${server.name} (ignoreReserve: ${this.ignoreReservedRam})`)
             if (!allowSplitting)
                 return threadsHere;
             maxThreads += threadsHere;
@@ -1999,7 +2086,7 @@ class Tool {
 }
 
 /** @param {NS} ns
- * @param {({name: string; shortName: string; shouldRun: () => Promise<boolean>; args: string[]; tail: boolean; requiredServer: string; threadSpreadingAllowed: boolean; })[]} allTools **/
+ * @param {({name: string; shortName: string; shouldRun: () => Promise<boolean>; args: string[]; tail: boolean; threadSpreadingAllowed: boolean; ignoreReservedRam: boolean; minRamReq: number, runOptions: RunOptions; })[]} allTools **/
 async function buildToolkit(ns, allTools) {
     log(ns, "buildToolkit");
     let toolCosts = await getNsDataThroughFile(ns, `Object.fromEntries(ns.args.map(s => [s, ns.getScriptRam(s, 'home')]))`,
