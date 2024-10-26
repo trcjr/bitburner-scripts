@@ -141,8 +141,7 @@ let highUtilizationIterations = 0;
 let lastShareTime = 0; // Tracks when share was last invoked so we can respect the configured share-cooldown
 let allTargetsPrepped = false;
 
-/** Ram-dodge getting updated player info. Note that this is the only async routine called in the main loop.
- * If latency or ram instability is an issue, you may wish to try uncommenting the direct request.
+/** Ram-dodge getting updated player info.
  * @param {NS} ns
  * @returns {Promise<Player>} */
 async function getPlayerInfo(ns) {
@@ -216,10 +215,19 @@ function reservedMoney(ns) {
 // script entry point
 /** @param {NS} ns **/
 export async function main(ns) {
-    try {
-        await startup(ns);
-    } catch (err) {
-        log(ns, `ERROR: daemon.js Caught a fatal error during startup: ${getErrorInfo(err)}`, true, 'error');
+    let startupAttempts = 0;
+    while (startupAttempts++ <= 5) {
+        try {
+            await startup(ns);
+        } catch (err) {
+            if (startupAttempts == 5)
+                log(ns, `ERROR: daemon.js Keeps catching a fatal error during startup: ${getErrorInfo(err)}`, true, 'error');
+            else {
+                log(ns, `WARN: daemon.js Caught an error during startup: ${getErrorInfo(err)}` +
+                    `\nWill try again (attempt ${startupAttempts} of 5)`, false, 'warning');
+                await ns.sleep(5000);
+            }
+        }
     }
 }
 
@@ -538,11 +546,6 @@ async function runPeriodicScripts(ns) {
             await runCommand(ns, `0; if(ns.hacknet.spendHashes("Sell for Money")) ns.toast('Sold 4 hashes for \$1M', 'success')`, '/Temp/sell-hashes-for-money.js');
         }
     }
-    // For early players, provide a hint to buy more home RAM asap:
-    if (!(4 in dictSourceFiles) && !homeServer.totalRam(true) < 64)
-        log(ns, `INFO: Reminder: Daemon.js can do a lot more if you have more Home RAM. Right now, you must buy this yourself.` +
-            `\nHead to the "City", visit [alpha ent.] (or other Tech store), and purchase at least 64 GB as soon as possible!` +
-            `\nAlso be sure to purchase TOR and run "buy -a" from the terminal until you own all hack tools.`, true, 'info');
 }
 
 // Helper that gets the either invokes a function that returns a value, or returns the value as-is if it is not a function.
@@ -567,7 +570,8 @@ async function tryRunTool(ns, tool) {
     }
     const args = funcResultOrValue(tool.args) || []; // Support either a static args array, or a function returning the args.
     const lowHomeRam = homeServer.totalRam(true) < 32; // Special-case. In early BN1.1, when home RAM is <32 GB, allow certain scripts to be run on any host
-    const runResult = lowHomeRam ? await arbitraryExecution(ns, tool, 1, args, backupServerName) :
+    const runResult = lowHomeRam ?
+        await arbitraryExecution(ns, tool, 1, args, allHostNames.includes(backupServerName) ? backupServerName : daemonHost) :
         await exec(ns, tool.name, daemonHost, tool.runOptions, ...args);
     if (runResult) {
         runningOnServer = await whichServerIsRunning(ns, tool.name, false);
@@ -662,6 +666,11 @@ async function doTargetingLoop(ns) {
                         .join('\n  ');
                     log(ns, targetsLog);
                     ns.write("/Temp/targets.txt", targetsLog, "w");
+                    // For early players, provide a hint to buy more home RAM asap:
+                    if (!(4 in dictSourceFiles) && !homeServer.totalRam(true) < 64)
+                        log(ns, `Reminder: Daemon.js can do a lot more if you have more Home RAM. Right now, you must buy this yourself.` +
+                            `\nHead to the "City", visit [alpha ent.] (or other Tech store), and purchase at least 64 GB as soon as possible!` +
+                            `\nAlso be sure to purchase TOR and run "buy -a" from the terminal until you own all hack tools.`, true, 'info');
                 }
             }
             // Processed servers will be split into various lists for generating a summary at the end

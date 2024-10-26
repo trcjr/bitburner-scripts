@@ -9,7 +9,7 @@ const argsSchema = [ // The set of all command line arguments
     ['next-bn', 0], // If we destroy the current BN, the next BN to start
     ['disable-auto-destroy-bn', false], // Set to true if you do not want to auto destroy this BN when done
     ['install-at-aug-count', 11], // Automatically install when we can afford this many new augmentations (with NF only counting as 1)
-    ['install-at-aug-plus-nf-count', 14], // or... automatically install when we can afford this many augmentations including additional levels of Neuroflux
+    ['install-at-aug-plus-nf-count', 15], // or... automatically install when we can afford this many augmentations including additional levels of Neuroflux
     ['install-for-augs', ["The Red Pill"]], // or... automatically install as soon as we can afford one of these augmentations
     ['install-countdown', 5 * 60 * 1000], // If we're ready to install, wait this long first to see if more augs come online (we might just be gaining momentum)
     ['time-before-boosting-best-hack-server', 15 * 60 * 1000], // Wait this long before picking our best hack-income server and spending hashes on boosting it
@@ -83,6 +83,7 @@ let ranCasino = false; // Flag to indicate whether we've stolen 10b from the cas
 let reservedPurchase = 0; // Flag to indicate whether we've reservedPurchase money and can still afford augmentations
 let alreadyJoinedDaedalus = false, autoJoinDaedalusUnavailable = false, reservingMoneyForDaedalus = false, prioritizeHackForDaedalus = false; // Flags to indicate that we should be keeping 100b cash on hand to earn an invite to Daedalus
 let lastScriptsCheck = 0; // Last time we got a listing of all running scripts
+let homeRam = 0; // Amount of RAM on the home server, last we checked
 let killScripts = []; // A list of scripts flagged to be restarted due to changes in priority
 let dictOwnedSourceFiles = [], unlockedSFs = [], nextBn = 0; // Info for the current bitnode
 let installedAugmentations = [], playerInstalledAugCount = 0, stanekLaunched = false; // Info for the current ascend
@@ -109,17 +110,18 @@ export async function main(ns) {
         log(ns, `WARNING: You have previously enabled the flag "--${flag}". Because of the way this script saves its run settings, the ` +
             `only way to now turn this back off will be to manually edit or delete the file ${ns.getScriptName()}.config.txt`, true);
 
-    let startUpRan = false;
-    while (true) {
+    let startUpRan = false, keepRunning = true;
+    while (keepRunning) {
         try {
             // Start-up actions, wrapped in error handling in case of temporary failures
             if (!startUpRan) startUpRan = await startUp(ns);
             // Main loop: Monitor progress in the current BN and automatically reset when we can afford TRP, or N augs.
-            await mainLoop(ns);
+            keepRunning = await mainLoop(ns);
         }
         catch (err) {
             log(ns, `WARNING: autopilot.js Caught (and suppressed) an unexpected error:` +
                 `\n${getErrorInfo(err)}`, false, 'warning');
+            keepRunning = shouldWeKeepRunning(ns);
         }
         await ns.sleep(options['interval']);
     }
@@ -134,7 +136,7 @@ async function startUp(ns) {
         alreadyJoinedDaedalus = autoJoinDaedalusUnavailable = reservingMoneyForDaedalus = prioritizeHackForDaedalus =
         bnCompletionSuppressed = stanekLaunched = false;
     playerInstalledAugCount = wdHack = null;
-    installCountdown = daemonStartTime = lastScriptsCheck = reservedPurchase = 0;
+    installCountdown = daemonStartTime = lastScriptsCheck = homeRam = reservedPurchase = 0;
     lastStatusLog = "";
     installedAugmentations = killScripts = [];
 
@@ -143,6 +145,7 @@ async function startUp(ns) {
     bitNodeMults = await tryGetBitNodeMultipliers(ns);
     dictOwnedSourceFiles = await getActiveSourceFiles(ns, false);
     unlockedSFs = await getActiveSourceFiles(ns, true);
+    homeRam = await getNsDataThroughFile(ns, `ns.getServerMaxRam(ns.args[0])`, null, ["home"]);
     try {
         installedAugmentations = !(4 in unlockedSFs) ? [] :
             await getNsDataThroughFile(ns, 'ns.singularity.getOwnedAugmentations()', '/Temp/player-augs-installed.txt');
@@ -193,13 +196,12 @@ async function persistConfigChanges(ns) {
  * @param {NS} ns */
 async function initializeNewBitnode(ns) {
     // Nothing to do here (yet)
-    //const player = await getNsDataThroughFile(ns, 'ns.getPlayer()');
 }
 
 /** Logic run periodically throughout the BN
  * @param {NS} ns */
 async function mainLoop(ns) {
-    const player = await getNsDataThroughFile(ns, 'ns.getPlayer()');
+    const player = await getPlayerInfo(ns);
     let stocksValue = 0;
     try { stocksValue = await getStocksValue(ns); } catch { /* Assume if this fails (insufficient ram) we also have no stocks */ }
     manageReservedMoney(ns, player, stocksValue);
@@ -208,6 +210,14 @@ async function mainLoop(ns) {
     await checkOnRunningScripts(ns, player);
     await maybeDoCasino(ns, player);
     await maybeInstallAugmentations(ns, player);
+    return shouldWeKeepRunning(ns); // Return false to shut down autopilot.js if we installed augs, or don't have enough home RAM
+}
+
+/** Ram-dodge getting player info.
+ * @param {NS} ns
+ * @returns {Promise<Player>} */
+async function getPlayerInfo(ns) {
+    return await getNsDataThroughFile(ns, `ns.getPlayer()`);
 }
 
 /** Logic run periodically to if there is anything we can do to speed along earning a Daedalus invite
@@ -330,7 +340,7 @@ async function checkIfBnIsComplete(ns, player) {
             reasonToStay = `Detected that you only have ${numSleeves} sleeves, but you could have ${shouldHaveSleeveCount}.`;
         else {
             let sleeveInfo = (/** @returns {SleevePerson[]} */() => [])();
-            await getNsDataThroughFile(ns, `ns.args.map(i => ns.sleeve.getSleeve(i))`, '/Temp/sleeve-getSleeve-all.txt', [...Array(numSleeves).keys()]);
+            sleeveInfo = await getNsDataThroughFile(ns, `ns.args.map(i => ns.sleeve.getSleeve(i))`, '/Temp/sleeve-getSleeve-all.txt', [...Array(numSleeves).keys()]);
             if (sleeveInfo.some(s => s.memory < 100))
                 reasonToStay = `Detected that you have ${numSleeves}/${shouldHaveSleeveCount} sleeves, but they do not all have the maximum memory of 100:\n  ` +
                     sleeveInfo.map((s, i) => `- Sleeve ${i} has ${s.memory}/100 memory`).join('\n  ');
@@ -412,8 +422,8 @@ async function checkOnRunningScripts(ns, player) {
     while (killScripts.length > 0)
         await killScript(ns, killScripts.pop(), runningScripts);
 
-    // Hold back on launching certain scripts if we are low on home RAM
-    const homeRam = await getNsDataThroughFile(ns, `ns.getServerMaxRam(ns.args[0])`, null, ["home"]);
+    // See if home ram has improved. We hold back on launching certain scripts if we are low on home RAM
+    homeRam = await getNsDataThroughFile(ns, `ns.getServerMaxRam(ns.args[0])`, null, ["home"]);
 
     // Launch stock-master in a way that emphasizes it as our main source of income early-on
     if (!findScript('stockmaster.js') && !reservingMoneyForDaedalus && homeRam >= 32)
@@ -522,8 +532,11 @@ async function checkOnRunningScripts(ns, player) {
             daemonRelaunchMessage ??= `Relaunching daemon.js with new arguments since the current instance doesn't include all the args we want.`;
             log(ns, daemonRelaunchMessage);
         }
-        launchScriptHelper(ns, 'daemon.js', daemonArgs);
+        let daemonPid = launchScriptHelper(ns, 'daemon.js', daemonArgs);
         daemonStartTime = Date.now();
+        // Open the tail window if it's the start of a new BN. Especially useful to new players.
+        if (getTimeInBitnode() < 1000 * 60 * 5 || homeRam == 8) // First 5 minutes, or BN1.1
+            ns.tail(daemonPid);
     }
 
     // Default work for faction args we think are ideal for speed-running BNs
@@ -609,10 +622,12 @@ async function maybeDoCasino(ns, player) {
     }
 }
 
-/** Retrieves the last faction manager output file, parses, and types it.
- * @param {NS} ns
- * @returns {{ affordable_nf_count: number, affordable_augs: [string], owned_count: number, unowned_count: number, total_rep_cost: number, total_aug_cost: number }}
- */
+/** Retrieves the last faction manager output file, parses, and provides type-hints for it.
+ * @returns {{ installed_augs: string[], installed_count: number, installed_count_nf: number, installed_count_ex_nf: number,
+ *             owned_augs: string[], owned_count: number, owned_count_nf: number, owned_count_ex_nf: number,
+ *             awaiting_install_augs: string[], awaiting_install_count: number, awaiting_install_count_nf: number, awaiting_install_count_ex_nf: number,
+ *             affordable_augs: string[], affordable_count: number, affordable_count_nf: number, affordable_count_ex_nf: number,
+ *             total_rep_cost: number, total_aug_cost: number, unowned_count: number }} */
 function getFactionManagerOutput(ns) {
     const facmanOutput = ns.read(factionManagerOutputFile)
     return !facmanOutput ? null : JSON.parse(facmanOutput)
@@ -622,10 +637,9 @@ function getFactionManagerOutput(ns) {
  * @param {NS} ns
  * @param {Player} player */
 async function maybeInstallAugmentations(ns, player) {
-    if (!(4 in unlockedSFs)) {
-        setStatus(ns, `No singularity access, so you're on your own. You should manually work for factions and install augmentations!`);
-        return false; // Cannot automate augmentations or installs without singularity
-    }
+    if (!(4 in unlockedSFs))  // Cannot automate augmentations or installs without singularity
+        return setStatus(ns, `No singularity access, so you're on your own. You should manually work for factions and install augmentations!`);
+
     // If we previously attempted to reserve money for an augmentation purchase order, do a fresh facman run to ensure it's still available
     if (reservedPurchase && installCountdown <= Date.now()) {
         log(ns, "INFO: Manually running faction-manager.js to ensure previously reserved purchase is still obtainable.");
@@ -640,21 +654,33 @@ async function maybeInstallAugmentations(ns, player) {
         setStatus(ns, `Faction manager output not available. Will try again later.`);
         return reservedPurchase = 0;
     }
-    const affordableAugCount = facman.affordable_augs.length;
-    playerInstalledAugCount = facman.owned_count;
+    playerInstalledAugCount = facman.installed_count; // Augmentations bought *and installed* by the player (used for Daedalus requirement)
 
-    // Determine whether we can afford enough augmentations to merit a reset
+    // Collect information about how many augmentations we need before it's worth resetting, based on the current configuration
     const reducedAugReq = Math.floor(options['reduced-aug-requirement-per-hour'] * getTimeInAug() / 3.6E6);
     const augsNeeded = Math.max(1, options['install-at-aug-count'] - reducedAugReq);
     const augsNeededInclNf = Math.max(1, options['install-at-aug-plus-nf-count'] - reducedAugReq);
-    const uniqueAugCount = affordableAugCount - Math.sign(facman.affordable_nf_count); // Don't count NF if included
+
+    // Get a count of pending augmentations (augs we plan to buy, plus any we've bought but not yet installed)
+    const pendingAugCount = facman.affordable_count_ex_nf + facman.awaiting_install_count_ex_nf; // Excludes neuroflux levels
+    const pendingNfCount = facman.affordable_count_nf + facman.awaiting_install_count_nf; // Only neuroflux levels
+    const pendingAugInclNfCount = pendingAugCount + pendingNfCount; // Includes neuroflux levels
+    // Create a list of augmentations pending install or pending puchase to display. Group all nf augs into one.
+    const strNF = "NeuroFlux Governor"
+    let augsToInstall = facman.awaiting_install_augs.filter(aug => aug != strNF)
+        .concat(...facman.affordable_augs.filter(aug => aug != strNF));
+    if (pendingNfCount > 0)
+        augsToInstall.push(`${strNF} (x${pendingNfCount})`)
+
+    // Determine whether we can afford enough augmentations to merit a reset
     let totalCost = facman.total_rep_cost + facman.total_aug_cost;
-    const augSummary = `${uniqueAugCount} of ${facman.unowned_count - 1} remaining augmentations` +
-        (facman.affordable_nf_count > 0 ? ` + ${facman.affordable_nf_count} levels of NeuroFlux.` : '.') +
-        (uniqueAugCount > 0 ? `\n  Augs: [\"${facman.affordable_augs.join("\", \"")}\"]` : '');
+    const augSummary = `${pendingAugCount} of ${facman.unpurchased_count - 1} remaining augmentations` + // Unowned - 1 because we can always buy more Neuroflux
+        (pendingNfCount > 0 ? ` + ${pendingNfCount} levels of NeuroFlux.` : '.') +
+        (pendingAugCount > 0 ? `\n  Augs: [\"${augsToInstall.join("\", \"")}\"]` : '');
     let resetStatus = `Reserving ${formatMoney(totalCost)} to install ${augSummary}`
     let shouldReset = options['install-for-augs'].some(a => facman.affordable_augs.includes(a)) ||
-        affordableAugCount >= augsNeeded || (affordableAugCount + facman.affordable_nf_count - 1) >= augsNeededInclNf;
+        pendingAugCount >= augsNeeded || pendingAugInclNfCount >= augsNeededInclNf;
+
     // If we are in Daedalus, and we do not yet have enough favour to unlock rep donations with Daedalus,
     // but we DO have enough rep to earn that favor on our next restart, trigger an install immediately (need at least 1 aug)
     if (player.factions.includes("Daedalus") && ns.read("/Temp/Daedalus-donation-rep-attained.txt")) {
@@ -663,12 +689,14 @@ async function maybeInstallAugmentations(ns, player) {
         if (totalCost == 0) totalCost = 1; // Hack, logic below expects some non-zero reserve in preparation for ascending.
     }
 
+    // TODO: If we are in BN8, we get a big cash influx on each reset and it may be worth doing an immediate install or 2 to purchse upgrades, then get more free cash.
+
     // If not ready to reset, set a status with our progress and return
     if (!shouldReset) {
         setStatus(ns, `Currently at ${formatDuration(getTimeInAug())} since last aug. ` +
             `Waiting for ${augsNeeded} new augs (or ${augsNeededInclNf} including NeuroFlux levels) before installing.` +
-            `\nCan currently get: ${augSummary}` +
-            `\n  Total Cost: ${formatMoney(totalCost)} (\`run faction-manager.js\` for details)`, augSummary);
+            `\nCan currently get: ${augSummary}` + (pendingAugCount == 0 ? '' : `\n  Total Cost: ${formatMoney(totalCost)}`) +
+            ` (\`run faction-manager.js\` for details)`, augSummary);
         return reservedPurchase = 0; // If we were previously reserving money for a purchase, reset that flag now
     }
     // If we want to reset, but there is a reason to delay, don't reset
@@ -699,7 +727,7 @@ async function maybeInstallAugmentations(ns, player) {
     // Kick off ascend.js
     let errLog;
     const ascendArgs = ['--install-augmentations', true, '--on-reset-script', ns.getScriptName()]
-    if (affordableAugCount == 0) // If we know we have 0 augs, but still wish to reset, we must enable soft resetting
+    if (pendingAugInclNfCount == 0) // If we know we would install 0 augs, but still wish to reset, we must enable soft resetting
         ascendArgs.push("--allow-soft-reset")
     let pid = launchScriptHelper(ns, 'ascend.js', ascendArgs);
     if (pid) {
@@ -715,9 +743,16 @@ async function maybeInstallAugmentations(ns, player) {
 /** Logic to detect if we are close to a milestone and should postpone installing augmentations until it is hit
  * @param {NS} ns
  * @param {Player} player
- * @param {{ affordable_nf_count: number, affordable_augs: [string], owned_count: number, unowned_count: number, total_rep_cost: number, total_aug_cost: number }} facmanOutput
+ * @param {{ installed_augs: string[], installed_count: number, installed_count_nf: number, installed_count_ex_nf: number,
+ *           owned_augs: string[], owned_count: number, owned_count_nf: number, owned_count_ex_nf: number,
+ *           awaiting_install_augs: string[], awaiting_install_count: number, awaiting_install_count_nf: number, awaiting_install_count_ex_nf: number,
+ *           affordable_augs: string[], affordable_count: number, affordable_count_nf: number, affordable_count_ex_nf: number,
+ *           total_rep_cost: number, total_aug_cost: number, unowned_count: number }} facmanOutput
 */
 async function shouldDelayInstall(ns, player, facmanOutput) {
+    // Don't install if we're currently grafting an augmentation
+    if (await checkIfGrafting(ns))
+        return true;
     // Are we close to being able to afford 4S TIX data?
     if (!options['disable-wait-for-4s'] && !(await getNsDataThroughFile(ns, `ns.stock.has4SDataTIXAPI()`))) {
         const totalWorth = player.money + await getStocksValue(ns);
@@ -737,9 +772,7 @@ async function shouldDelayInstall(ns, player, facmanOutput) {
     // In BN8, money is hard to come by, so if we're in Daedalus, but can't access TRP rep yet, wait until we have
     // enough rep, or enough money to donate for rep to buy TRP (Reminder: donations always unlocked in BN8)
     if (resetInfo.currentNode == 8 && player.factions.includes("Daedalus") && (wdHack || 0) == 0) {
-        // Ensure the player hasn't manually purchased (but not yet installed) TRP
-        const ownedAugmentations = await getNsDataThroughFile(ns, `ns.singularity.getOwnedAugmentations(true)`, '/Temp/player-augs-purchased.txt');
-        if (!facmanOutput.affordable_augs.includes("The Red Pill") && !ownedAugmentations.includes("The Red Pill")) {
+        if (!facmanOutput.affordable_augs.includes("The Red Pill") && !facmanOutput.awaiting_install_augs.includes("The Red Pill")) {
             setStatus(ns, `Not installing until we have enough Daedalus rep to install TRP on our next reset.`)
             return true;
         }
@@ -747,6 +780,24 @@ async function shouldDelayInstall(ns, player, facmanOutput) {
     // TODO: Bladeburner black-op in progress
     // TODO: Close to the rep needed for unlocking donations with a new faction?
     return false;
+}
+
+let wasGrafting = false;
+
+/** Checks if we are current grafting. If so, certain actions should not be taken.
+ * @param {NS} ns
+ * @returns {bool} true if the player is grafting, false otherwise. */
+async function checkIfGrafting(ns) {
+    let currentWork = (/**@returns{Task|null}*/() => null)();
+    currentWork = await getNsDataThroughFile(ns, 'ns.singularity.getCurrentWork()');
+    // Never interrupt grafting
+    if (currentWork?.type == "GRAFTING") {
+        if (!wasGrafting) // Only log the first time we detect we've started grafting
+            log(ns, "Grafting in progress. autopilot.js will make sure to not install augmentations or otherwise interrupt it.");
+        wasGrafting = true;
+    }
+    else
+        wasGrafting = false
 }
 
 /** Consolidated logic for all the times we want to reserve money
@@ -780,6 +831,28 @@ function manageReservedMoney(ns, player, stocksValue) {
     if(moneyReserved) ns.write("reserve.txt", 0, "w"); // Remove the casino reserve we would have placed
     return moneyReserved = false;
     */
+}
+
+/** Logic to determine whether we should keep running, or shut down autopilot.js for some reason.
+ * @param {NS} ns
+ * @returns {boolean} true if we should keep running. False if we should shut down this script. */
+function shouldWeKeepRunning(ns) {
+    if (4 in unlockedSFs)
+        return true; // If we have SF4 - run always
+    // If we've gotten daemon.js launched, but only have 8GB ram, we must shut down for now
+    if (homeRam == 8 && daemonStartTime > 0) {
+        log(ns, `WARN: (not an actual warning, just trying to make this message stand out.)` +
+            `\n` + '-'.repeat(100) +
+            `\n\n  Welcome to bitburner and thanks for using my scripts!` +
+            `\n\n  Currently, your available RAM on home (8 GB) is too small to keep autopilot.js running.` +
+            `\n  The priority should just be to run "daemon.js" for a while until you have enough money to` +
+            `\n  purchase some home RAM (which you must do manually at a store like [alpha ent.] in the city),` +
+            `\n\n  Once you have more home ram, feel free to 'run ${ns.getScriptName()}' again!` +
+            `\n\n` + '-'.repeat(100), true);
+        return false; // Daemon.js needs more room to breath
+    }
+    // Otherwise, keep running
+    return true;
 }
 
 /** Helper to launch a script and log whether if it succeeded or failed
