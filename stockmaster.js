@@ -85,7 +85,7 @@ export async function main(ns) {
         await liquidate(ns); // Sell all stocks
         return;
     } // Otherwise, prevent multiple instances of this script from being started, even with different args.
-    if (await instanceCount(ns) > 1) return;
+    if ((await instanceCount(ns)) > 1) return;
 
     ns.disableLog("ALL");
     // Extract various options from the args (globals, purchasing decision factors, pre-4s factors)
@@ -436,7 +436,7 @@ let launchSummaryTail = async ns => {
     if (await getNsDataThroughFile(ns, `ns.scriptRunning('${summaryTailScript}', ns.getHostname())`, '/Temp/stockmarket-summary-is-running.txt'))
         return;
     //await getNsDataThroughFile(ns, `ns.scriptKill('${summaryTailScript}', ns.getHostname())`, summaryTailScript.replace('.js', '-kill.js')); // Only needed if we're changing the script below
-    await runCommand(ns, `ns.disableLog('sleep'); ns.tail(); let lastRead = '';
+    await runCommand(ns, `ns.disableLog('sleep'); tail(ns); let lastRead = '';
         while (true) {
             let read = ns.read('${summaryFile}');
             if (lastRead != read) ns.print(lastRead = read);

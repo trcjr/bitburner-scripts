@@ -184,7 +184,8 @@ function getDefaultCommandFileName(command, ext = '.txt') {
 export async function getNsDataThroughFile_Custom(ns, fnRun, command, fName = null, args = [], verbose = false, maxRetries = 5, retryDelayMs = 50, silent = false) {
     checkNsInstance(ns, '"getNsDataThroughFile_Custom"');
     // If any args were skipped by passing null or undefined, set them to the default
-    if (args == null) args = []; if (verbose == null) verbose = false; if (maxRetries = null) maxRetries = 5; if (retryDelayMs = null) retryDelayMs = 50; if (silent == null) silent = false;
+    if (args == null) args = []; if (verbose == null) verbose = false;
+    if (maxRetries == null) maxRetries = 5; if (retryDelayMs == null) retryDelayMs = 50; if (silent == null) silent = false;
     if (!verbose) disableLogs(ns, ['read']);
     fName = fName || getDefaultCommandFileName(command);
     const fNameCommand = fName + '.js'
@@ -264,9 +265,9 @@ export async function runCommand(ns, command, fileName, args = [], verbose = fal
     return await runCommand_Custom(ns, ns.run, command, fileName, args, verbose, maxRetries, retryDelayMs, silent);
 }
 
-const _cachedExports = [];
+const _cachedExports = []; // A cached list of functions exported by helpers.js. Should be fine as long as we aren't actively editing it.
 /** @param {NS} ns The nestcript instance passed to your script's main entry point
- * @returns {string[]} The set of all funciton names exported by this file. */
+ * @returns {string[]} The set of all function names exported by this file. */
 function getExports(ns) {
     if (_cachedExports.length > 0) return _cachedExports;
     const scriptHelpersRows = ns.read(getFilePath('helpers.js')).split("\n");
@@ -375,7 +376,7 @@ export async function waitForProcessToComplete_Custom(ns, fnIsAlive, pid, verbos
             break; // Script is done running
         }
         if (verbose && retries % 100 === 0) ns.print(`Waiting for pid ${pid} to complete... (${formatDuration(Date.now() - start)})`);
-        await ns.sleep(sleepMs);
+        await ns.sleep(sleepMs); // TODO: If we can switch to `await nextPortWrite(pid)` for signalling temp script completion, it would return faster.
         sleepMs = Math.min(sleepMs * 2, 200);
     }
     // Make sure that the process has shut down and we haven't just stopped retrying
@@ -395,6 +396,10 @@ function asError(error) {
  * @param {NS} ns The nestcript instance passed to your script's main entry point */
 export async function autoRetry(ns, fnFunctionThatMayFail, fnSuccessCondition, errorContext = "Success condition not met",
     maxRetries = 5, initialRetryDelayMs = 50, backoffRate = 3, verbose = false, tprintFatalErrors = true, silent = false) {
+    // If any args were skipped by passing null or undefined, set them to the default
+    if (errorContext == null) errorContext = "Success condition not met";
+    if (maxRetries == null) maxRetries = 5; if (initialRetryDelayMs == null) initialRetryDelayMs = 50; if (backoffRate == null) backoffRate = 3;
+    if (verbose == null) verbose = false; if (tprintFatalErrors == null) tprintFatalErrors = true; if (silent == null) silent = false;
     checkNsInstance(ns, '"autoRetry"');
     let retryDelayMs = initialRetryDelayMs, attempts = 0;
     let sucessConditionMet;
@@ -433,6 +438,7 @@ export async function autoRetry(ns, fnFunctionThatMayFail, fnSuccessCondition, e
             if (fatal) throw asError(error);
         }
     }
+    throw new Error("Unexpected return from autoRetry");
 }
 
 /** Helper for extracting the error message from an error thrown by the game.
@@ -643,9 +649,9 @@ async function getHardCodedBitNodeMultipliers(ns, fnGetNsDataThroughFile) {
 export async function instanceCount(ns, onHost = "home", warn = true, tailOtherInstances = true) {
     checkNsInstance(ns, '"alreadyRunning"');
     const scriptName = ns.getScriptName();
-    let otherInstances = (/**@returns{ProcessInfo[]}*/() => [])();
+    let otherInstancePids = (/**@returns{number[]}*/() => [])();
     try {
-        otherInstances = await getNsDataThroughFile(ns, 'ns.ps(ns.args[0]).filter(p => p.filename == ns.args[1]).map(p => p.pid)',
+        otherInstancePids = await getNsDataThroughFile(ns, 'ns.ps(ns.args[0]).filter(p => p.filename == ns.args[1]).map(p => p.pid)',
             '/Temp/ps-other-instances.txt', [onHost, scriptName]);
     } catch (err) {
         if (err.message?.includes("insufficient RAM") ?? false) {
@@ -656,14 +662,15 @@ export async function instanceCount(ns, onHost = "home", warn = true, tailOtherI
         }
         else throw err;
     }
-    if (otherInstances.length >= 2) {
+    if (otherInstancePids.length >= 2) {
         if (warn)
-            log(ns, `WARNING: You cannot start multiple versions of this script (${scriptName}). Please shut down the other instance first.` +
+            log(ns, `WARNING: You cannot start multiple versions of this script (${scriptName}). Please shut down the other instance(s) first: ${otherInstancePids}` +
                 (tailOtherInstances ? ' (To help with this, a tail window for the other instance will be opened)' : ''), true, 'warning');
         if (tailOtherInstances) // Tail all but the last pid, since it will belong to the current instance (which will be shut down)
-            otherInstances.slice(0, otherInstances.length - 1).forEach(pid => ns.tail(pid));
+            otherInstancePids.slice(0, otherInstancePids.length - 1).forEach(pid => tail(ns, pid));
     }
-    return otherInstances.length;
+    //ns.tprint(`instanceCount: ${otherInstancePids.length}\n  ${new Error().stack.replaceAll("@", "   @").replaceAll("\n", "\n  ")}\n\n`)
+    return otherInstancePids.length;
 }
 
 /** Helper function to get all stock symbols, or null if you do not have TIX api access.
@@ -699,7 +706,7 @@ export async function getStocksValue(ns) {
 /** Returns a helpful error message if we forgot to pass the ns instance to a function
  *  @param {NS} ns The nestcript instance passed to your script's main entry point */
 export function checkNsInstance(ns, fnName = "this function") {
-    if (ns === undefined || !ns.print) throw new Error(`The first argument to ${fnName} should be a 'ns' instance.`);
+    if (ns === undefined || !ns.print) throw new Error(`The first argument to function ${fnName} should be a 'ns' instance.`);
     return ns;
 }
 
@@ -797,3 +804,27 @@ export function unEscapeArrayArgs(args) {
     const escapeChars = ['"', "'", "`"];
     return args.map(arg => escapeChars.some(c => arg.startsWith(c) && arg.endsWith(c)) ? arg.slice(1, -1) : arg);
 }
+
+/**
+ * Custom tail function which also applies default resizes and tail window placement.
+ * This algorithm is not perfect but for the most part should not generate overlaps of the window's title bar.
+ * @param {NS} ns The nestcript instance passed to your script's main entry point
+ * @param {number|undefined} processId The id of the process to tail, or null to use the current process id
+ */
+export function tail(ns, processId = undefined) {
+    checkNsInstance(ns, '"tail"');
+    processId ??= ns.pid
+    ns.tail(processId);
+    // Don't move or resize tail windows that were previously opened and possibly moved by the player
+    if (tailedPids.has(processId))
+        return //ns.tprint(`PID was previously moved ${processId}`);
+    // By default, make all tail windows take up 75% of the width, 25% of the height available
+    const [width, height] = ns.ui.windowSize();
+    ns.resizeTail(width * 0.75, height * 0.25, processId);
+    // Cascade windows: After each tail, shift the window slightly down and over so that they don't overlap
+    let offsetPct = ((((tailedPids.size % 30.0) / 30.0) + tailedPids.size) % 6.0) / 6.0;
+    ns.moveTail(offsetPct * (width * 0.25 - 300) + 250, offsetPct * (height * 0.75 - 100) + 50, processId);
+    tailedPids.add(processId);
+}
+// TODO: PIDs are reset on install, but this cache isn't, so this isn't a good long term solution
+const tailedPids = new Set([-1]); // The pids we previously configured a tail window for
