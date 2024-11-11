@@ -209,7 +209,7 @@ export async function getNsDataThroughFile_Custom(ns, fnRun, command, fName = nu
     // If an error occurs, it will write an empty file to avoid old results being misread.
     const commandToFile = `let r;try{r=JSON.stringify(\n` +
         `    ${command}\n` +
-        `);}catch(e){r="ERROR: "+(typeof e=='string'?e:e?.message??JSON.stringify(e));}\n` +
+        `, jsonReplacer);}catch(e){r="ERROR: "+(typeof e=='string'?e:e?.message??JSON.stringify(e));}\n` +
         `const f="${fName}"; if(ns.read(f)!==r) ns.write(f,r,'w')`;
     // Run the command with auto-retries if it fails
     const pid = await runCommand_Custom(ns, fnRun, commandToFile, fNameCommand, args, verbose, maxRetries, retryDelayMs, silent);
@@ -240,6 +240,11 @@ export function jsonReplacer(key, value) {
             type: 'bigint',
             value: value.toString()
         };
+    } else if (value instanceof Map) {
+        return {
+            dataType: 'Map',
+            value: Array.from(value.entries()),
+        };
     } else {
         return value;
     }
@@ -247,8 +252,13 @@ export function jsonReplacer(key, value) {
 
 /** Allows us to deserialize special values created by the above jsonReplacer */
 export function jsonReviver(key, value) {
-    if (value && value.type == 'bigint')
-        return BigInt(value.value);
+    if (typeof value === 'object' && value !== null) {
+        if (value && value.type == 'bigint')
+            return BigInt(value.value);
+        else if (value.dataType === 'Map') {
+            return new Map(value.value);
+        }
+    }
     return value;
 }
 
@@ -389,7 +399,9 @@ export async function waitForProcessToComplete_Custom(ns, fnIsAlive, pid, verbos
 
 /** If the argument is an Error instance, returns it as is, otherwise, returns a new Error instance. */
 function asError(error) {
-    return error instanceof Error ? error : new Error(typeof error === 'string' ? error : JSON.stringify(error));
+    return error instanceof Error ? error :
+        new Error(typeof error === 'string' ? error :
+            JSON.stringify(error, jsonReplacer)); // TODO: jsonReplacer to support ScriptDeath objects and other custom Bitburner throws
 }
 
 /** Helper to retry something that failed temporarily (can happen when e.g. we temporarily don't have enough RAM to run)
@@ -530,22 +542,37 @@ export async function getActiveSourceFiles(ns, includeLevelsFromCurrentBitnode =
 export async function getActiveSourceFiles_Custom(ns, fnGetNsDataThroughFile, includeLevelsFromCurrentBitnode = true, silent = true) {
     checkNsInstance(ns, '"getActiveSourceFiles"');
     // Find out what source files the user has unlocked
-    let dictSourceFiles;
+    let dictSourceFiles = (/**@returns{{[bitNodeN: number]: number;}}*/() => null)();
     try {
         dictSourceFiles = await fnGetNsDataThroughFile(ns,
             `Object.fromEntries(ns.singularity.getOwnedSourceFiles().map(sf => [sf.n, sf.lvl]))`,
-            '/Temp/owned-source-files.txt', null, null, null, null, silent);
-    } catch { dictSourceFiles = {}; } // If this fails (e.g. presumably due to low RAM or no singularity access), return an empty dictionary
-    // If the user is currently in a given bitnode, they will have its features unlocked
-    // TODO: This is true of BN4, but not BN14.2, Check them all!
-    if (includeLevelsFromCurrentBitnode) {
-        try {
-            const currentNode = (await fnGetNsDataThroughFile(ns, 'ns.getResetInfo()', '/Temp/reset-info.txt', null, null, null, null, silent)).currentNode;
-            // In some Bitnodes, we get the *effects* of source file level 3 just by being in the bitnode.
-            let effectiveSfLevel = [4, 8].includes(currentNode) ? 3 : 1;
-            dictSourceFiles[currentNode] = Math.max(effectiveSfLevel, dictSourceFiles[currentNode] || 0);
-        } catch { /* We are expected to be fault-tolerant in low-ram conditions */ }
+            '/Temp/getOwnedSourceFiles-asDict.txt', null, null, null, null, silent);
+    } catch { } // If this fails (e.g. presumably due to low RAM or no singularity access), default to an empty dictionary
+    dictSourceFiles ??= {};
+
+    // Try to get reset info
+    let resetInfo = (/**@returns{ResetInfo}*/() => null)();
+    try {
+        resetInfo = await fnGetNsDataThroughFile(ns, 'ns.getResetInfo()', null, null, null, null, null, silent);
+    } catch { } // As above, suppress any errors and use a fall-back to survive low ram conditions.
+    resetInfo ??= { currentNode: 0 }
+
+    // If the user is currently in a given bitnode, they will have its features unlocked. Include these "effective" levels if requested;
+    if (includeLevelsFromCurrentBitnode && resetInfo.currentNode != 0) {
+        // In some Bitnodes, we get the *effects* of source file level 3 just by being in the bitnode
+        // TODO: This is true of some BNs (BN4), but not others (BN14.2), Check them all!
+        let effectiveSfLevel = [4, 8].includes(resetInfo.currentNode) ? 3 : 1;
+        dictSourceFiles[resetInfo.currentNode] = Math.max(effectiveSfLevel, dictSourceFiles[resetInfo.currentNode] || 0);
     }
+
+    // If any bitNodeOptions were set, it might reduce our source file levels for gameplay purposes,
+    // but the game currently has a bug where getOwnedSourceFiles won't reflect this, so we must do it ourselves.
+    if ((resetInfo?.bitNodeOptions?.sourceFileOverrides?.size ?? 0) > 0) {
+        resetInfo.bitNodeOptions.sourceFileOverrides.forEach((sfLevel, bn) => dictSourceFiles[bn] = sfLevel);
+        // Completely remove keys whose override level is 0
+        Object.keys(dictSourceFiles).filter(bn => dictSourceFiles[bn] == 0).forEach(bn => delete dictSourceFiles[bn]);
+    }
+
     return dictSourceFiles;
 }
 
@@ -579,65 +606,68 @@ export async function tryGetBitNodeMultipliers_Custom(ns, fnGetNsDataThroughFile
  *  We still prefer to use the API though, this is just a a fallback, but it may become stale over time.
  * @param {NS} ns The nestcript instance passed to your script's main entry point
  * @param {(ns: NS, command: string, fName?: string, args?: any, verbose?: any, maxRetries?: number, retryDelayMs?: number) => Promise<any>} fnGetNsDataThroughFile getActiveSourceFiles Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage
+ * @param {number} bnOverride The bitnode for which to retrieve multipliers. Defaults to the current BN if null.
  * @returns {Promise<BitNodeMultipliers>} a mocked BitNodeMultipliers instance with hard-coded values. */
-async function getHardCodedBitNodeMultipliers(ns, fnGetNsDataThroughFile) {
-    let bn = 1;
-    try { bn = (await fnGetNsDataThroughFile(ns, 'ns.getResetInfo()', '/Temp/reset-info.txt')).currentNode; }
-    catch { /* We are expected to be fault-tolerant in low-ram conditions */ }
-    return {
-        AgilityLevelMultiplier: [1, 1, 1, 1, 1, 1, 1, 1, 0.45, 0.4, 1, 1, 0.7, 0.5][bn - 1],
-        AugmentationMoneyCost: [1, 1, 3, 1, 2, 1, 3, 1, 1, 5, 2, 1, 1, 1.5][bn - 1],
-        AugmentationRepCost: [1, 1, 3, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1][bn - 1],
-        BladeburnerRank: [1, 1, 1, 1, 1, 1, 0.6, 0, 0.9, 0.8, 1, 1, 0.45, 0.6][bn - 1],
-        BladeburnerSkillCost: [1, 1, 1, 1, 1, 1, 2, 1, 1.2, 1, 1, 1, 2, 2][bn - 1],
-        CharismaLevelMultiplier: [1, 1, 1, 1, 1, 1, 1, 1, 0.45, 0.4, 1, 1, 1, 1][bn - 1],
-        ClassGymExpGain: [1, 1, 1, 0.5, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 1][bn - 1],
-        CodingContractMoney: [1, 1, 1, 1, 1, 1, 1, 0, 1, 0.5, 0.25, 1, 0.4, 1][bn - 1],
-        CompanyWorkExpGain: [1, 1, 1, 0.5, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 1][bn - 1],
-        CompanyWorkMoney: [1, 1, 0.25, 0.1, 1, 0.5, 0.5, 0, 1, 0.5, 0.5, 1, 0.4, 1][bn - 1],
-        CompanyWorkRepGain: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.2][bn - 1],
-        CorporationDivisions: [1, 0.9, 1, 1, 0.75, 0.8, 0.8, 0, 0.8, 0.9, 0.9, 0.5, 0.4, 0.8][bn - 1],
-        CorporationSoftcap: [1, 0.9, 1, 1, 1, 0.9, 0.9, 0, 0.75, 0.9, 0.9, 0.8, 0.4, 0.9][bn - 1],
-        CorporationValuation: [1, 1, 1, 1, 0.75, 0.2, 0.2, 0, 0.5, 0.5, 0.1, 1, 0.001, 0.4][bn - 1],
-        CrimeExpGain: [1, 1, 1, 0.5, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 1][bn - 1],
-        CrimeMoney: [1, 3, 0.25, 0.2, 0.5, 0.75, 0.75, 0, 0.5, 0.5, 3, 1, 0.4, 0.75][bn - 1],
-        CrimeSuccessRate: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.4][bn - 1],
-        DaedalusAugsRequirement: [30, 30, 30, 30, 30, 35, 35, 30, 30, 30, 30, 31, 30, 30][bn - 1],
-        DefenseLevelMultiplier: [1, 1, 1, 1, 1, 1, 1, 1, 0.45, 0.4, 1, 1, 0.7, 1][bn - 1],
-        DexterityLevelMultiplier: [1, 1, 1, 1, 1, 1, 1, 1, 0.45, 0.4, 1, 1, 0.7, 0.5][bn - 1],
-        FactionPassiveRepGain: [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1][bn - 1],
-        FactionWorkExpGain: [1, 1, 1, 0.5, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 1][bn - 1],
-        FactionWorkRepGain: [1, 0.5, 1, 0.75, 1, 1, 1, 1, 1, 1, 1, 1, 0.6, 0.2][bn - 1],
-        FourSigmaMarketDataApiCost: [1, 1, 1, 1, 1, 1, 2, 1, 4, 1, 4, 1, 10, 1][bn - 1],
-        FourSigmaMarketDataCost: [1, 1, 1, 1, 1, 1, 2, 1, 5, 1, 4, 1, 10, 1][bn - 1],
-        GangSoftcap: [1, 1, 0.9, 1, 1, 0.7, 0.7, 0, 0.8, 0.9, 1, 0.8, 0.3, 0.7][bn - 1],
-        GangUniqueAugs: [1, 1, 0.5, 0.5, 0.5, 0.2, 0.2, 0, 0.25, 0.25, 0.75, 1, 0.1, 0.4][bn - 1],
-        GoPower: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4][bn - 1],
-        HackExpGain: [1, 1, 1, 0.4, 0.5, 0.25, 0.25, 1, 0.05, 1, 0.5, 1, 0.1, 1][bn - 1],
-        HackingLevelMultiplier: [1, 0.8, 0.8, 1, 1, 0.35, 0.35, 1, 0.5, 0.35, 0.6, 1, 0.25, 0.4][bn - 1],
-        HackingSpeedMultiplier: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.3][bn - 1],
-        HacknetNodeMoney: [1, 1, 0.25, 0.05, 0.2, 0.2, 0.2, 0, 1, 0.5, 0.1, 1, 0.4, 0.25][bn - 1],
-        HomeComputerRamCost: [1, 1, 1.5, 1, 1, 1, 1, 1, 5, 1.5, 1, 1, 1, 1][bn - 1],
-        InfiltrationMoney: [1, 3, 1, 1, 1.5, 0.75, 0.75, 0, 1, 0.5, 2.5, 1, 1, 0.75][bn - 1],
-        InfiltrationRep: [1, 1, 1, 1, 1.5, 1, 1, 1, 1, 1, 2.5, 1, 1, 1][bn - 1],
-        ManualHackMoney: [1, 1, 1, 1, 1, 1, 1, 0, 1, 0.5, 1, 1, 1, 1][bn - 1],
-        PurchasedServerCost: [1, 1, 2, 1, 1, 1, 1, 1, 1, 5, 1, 1, 1, 1][bn - 1],
-        PurchasedServerSoftcap: [1, 1.3, 1.3, 1.2, 1.2, 2, 2, 4, 1, 1.1, 2, 1, 1.6, 1][bn - 1],
-        PurchasedServerLimit: [1, 1, 1, 1, 1, 1, 1, 1, 0, 0.6, 1, 1, 1, 1][bn - 1],
-        PurchasedServerMaxRam: [1, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 1, 1, 1, 1][bn - 1],
-        RepToDonateToFaction: [1, 1, 0.5, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1][bn - 1],
-        ScriptHackMoney: [1, 1, 0.2, 0.2, 0.15, 0.75, 0.5, 0.3, 0.1, 0.5, 1, 1, 0.2, 0.3][bn - 1],
-        ScriptHackMoneyGain: [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1][bn - 1],
-        ServerGrowthRate: [1, 0.8, 0.2, 1, 1, 1, 1, 1, 1, 1, 0.2, 1, 1, 1][bn - 1],
-        ServerMaxMoney: [1, 0.08, 0.04, 0.1125, 1, 0.2, 0.2, 1, 0.01, 1, 0.01, 1, 0.3375, 0.7][bn - 1],
-        ServerStartingMoney: [1, 0.4, 0.2, 0.75, 0.5, 0.5, 0.5, 1, 0.1, 1, 0.1, 1, 0.75, 0.5][bn - 1],
-        ServerStartingSecurity: [1, 1, 1, 1, 2, 1.5, 1.5, 1, 2.5, 1, 1, 1.5, 3, 1.5][bn - 1],
-        ServerWeakenRate: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1][bn - 1],
-        StrengthLevelMultiplier: [1, 1, 1, 1, 1, 1, 1, 1, 0.45, 0.4, 1, 1, 0.7, 0.5][bn - 1],
-        StaneksGiftPowerMultiplier: [1, 2, 0.75, 1.5, 1.3, 0.5, 0.9, 1, 0.5, 0.75, 1, 1, 2, 0.5][bn - 1],
-        StaneksGiftExtraSize: [0, -6, -2, 0, 0, 2, -1, -99, 2, -3, 0, 1, 1, -1][bn - 1],
-        WorldDaemonDifficulty: [1, 5, 2, 3, 1.5, 2, 2, 1, 2, 2, 1.5, 1, 3, 5][bn - 1]
+export async function getHardCodedBitNodeMultipliers(ns, fnGetNsDataThroughFile, bnOverride = null) {
+    let bn = bnOverride ?? 1;
+    if (!bnOverride) {
+        try { bn = (await fnGetNsDataThroughFile(ns, 'ns.getResetInfo()', '/Temp/reset-info.txt')).currentNode; }
+        catch { /* We are expected to be fault-tolerant in low-ram conditions */ }
     }
+    return Object.fromEntries(Object.entries({
+        AgilityLevelMultiplier: /*     */[1, 1, 1, 1, 1, 1, 1, 1, 0.45, 0.4, 1, 1, 0.7, 0.5],
+        AugmentationMoneyCost: /*      */[1, 1, 3, 1, 2, 1, 3, 1, 1, 5, 2, 1, 1, 1.5],
+        AugmentationRepCost: /*        */[1, 1, 3, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1],
+        BladeburnerRank: /*            */[1, 1, 1, 1, 1, 1, 0.6, 0, 0.9, 0.8, 1, 1, 0.45, 0.6],
+        BladeburnerSkillCost: /*       */[1, 1, 1, 1, 1, 1, 2, 1, 1.2, 1, 1, 1, 2, 2],
+        CharismaLevelMultiplier: /*    */[1, 1, 1, 1, 1, 1, 1, 1, 0.45, 0.4, 1, 1, 1, 1],
+        ClassGymExpGain: /*            */[1, 1, 1, 0.5, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 1],
+        CodingContractMoney: /*        */[1, 1, 1, 1, 1, 1, 1, 0, 1, 0.5, 0.25, 1, 0.4, 1],
+        CompanyWorkExpGain: /*         */[1, 1, 1, 0.5, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 1],
+        CompanyWorkMoney: /*           */[1, 1, 0.25, 0.1, 1, 0.5, 0.5, 0, 1, 0.5, 0.5, 1, 0.4, 1],
+        CompanyWorkRepGain: /*         */[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.2],
+        CorporationDivisions: /*       */[1, 0.9, 1, 1, 0.75, 0.8, 0.8, 0, 0.8, 0.9, 0.9, 0.5, 0.4, 0.8],
+        CorporationSoftcap: /*         */[1, 0.9, 1, 1, 1, 0.9, 0.9, 0, 0.75, 0.9, 0.9, 0.8, 0.4, 0.9],
+        CorporationValuation: /*       */[1, 1, 1, 1, 0.75, 0.2, 0.2, 0, 0.5, 0.5, 0.1, 1, 0.001, 0.4],
+        CrimeExpGain: /*               */[1, 1, 1, 0.5, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 1],
+        CrimeMoney: /*                 */[1, 3, 0.25, 0.2, 0.5, 0.75, 0.75, 0, 0.5, 0.5, 3, 1, 0.4, 0.75],
+        CrimeSuccessRate: /*           */[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.4],
+        DaedalusAugsRequirement: /*    */[30, 30, 30, 30, 30, 35, 35, 30, 30, 30, 30, 31, 30, 30],
+        DefenseLevelMultiplier: /*     */[1, 1, 1, 1, 1, 1, 1, 1, 0.45, 0.4, 1, 1, 0.7, 1],
+        DexterityLevelMultiplier: /*   */[1, 1, 1, 1, 1, 1, 1, 1, 0.45, 0.4, 1, 1, 0.7, 0.5],
+        FactionPassiveRepGain: /*      */[1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        FactionWorkExpGain: /*         */[1, 1, 1, 0.5, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 1],
+        FactionWorkRepGain: /*         */[1, 0.5, 1, 0.75, 1, 1, 1, 1, 1, 1, 1, 1, 0.6, 0.2],
+        FourSigmaMarketDataApiCost: /* */[1, 1, 1, 1, 1, 1, 2, 1, 4, 1, 4, 1, 10, 1],
+        FourSigmaMarketDataCost: /*    */[1, 1, 1, 1, 1, 1, 2, 1, 5, 1, 4, 1, 10, 1],
+        GangSoftcap: /*                */[1, 1, 0.9, 1, 1, 0.7, 0.7, 0, 0.8, 0.9, 1, 0.8, 0.3, 0.7],
+        GangUniqueAugs: /*             */[1, 1, 0.5, 0.5, 0.5, 0.2, 0.2, 0, 0.25, 0.25, 0.75, 1, 0.1, 0.4],
+        GoPower: /*                    */[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4],
+        HackExpGain: /*                */[1, 1, 1, 0.4, 0.5, 0.25, 0.25, 1, 0.05, 1, 0.5, 1, 0.1, 1],
+        HackingLevelMultiplier: /*     */[1, 0.8, 0.8, 1, 1, 0.35, 0.35, 1, 0.5, 0.35, 0.6, 1, 0.25, 0.4],
+        HackingSpeedMultiplier: /*     */[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.3],
+        HacknetNodeMoney: /*           */[1, 1, 0.25, 0.05, 0.2, 0.2, 0.2, 0, 1, 0.5, 0.1, 1, 0.4, 0.25],
+        HomeComputerRamCost: /*        */[1, 1, 1.5, 1, 1, 1, 1, 1, 5, 1.5, 1, 1, 1, 1],
+        InfiltrationMoney: /*          */[1, 3, 1, 1, 1.5, 0.75, 0.75, 0, 1, 0.5, 2.5, 1, 1, 0.75],
+        InfiltrationRep: /*            */[1, 1, 1, 1, 1.5, 1, 1, 1, 1, 1, 2.5, 1, 1, 1],
+        ManualHackMoney: /*            */[1, 1, 1, 1, 1, 1, 1, 0, 1, 0.5, 1, 1, 1, 1],
+        PurchasedServerCost: /*        */[1, 1, 2, 1, 1, 1, 1, 1, 1, 5, 1, 1, 1, 1],
+        PurchasedServerSoftcap: /*     */[1, 1.3, 1.3, 1.2, 1.2, 2, 2, 4, 1, 1.1, 2, 1, 1.6, 1],
+        PurchasedServerLimit: /*       */[1, 1, 1, 1, 1, 1, 1, 1, 0, 0.6, 1, 1, 1, 1],
+        PurchasedServerMaxRam: /*      */[1, 1, 1, 1, 1, 1, 1, 1, 1, 0.5, 1, 1, 1, 1],
+        RepToDonateToFaction: /*       */[1, 1, 0.5, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1],
+        ScriptHackMoney: /*            */[1, 1, 0.2, 0.2, 0.15, 0.75, 0.5, 0.3, 0.1, 0.5, 1, 1, 0.2, 0.3],
+        ScriptHackMoneyGain: /*        */[1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1],
+        ServerGrowthRate: /*           */[1, 0.8, 0.2, 1, 1, 1, 1, 1, 1, 1, 0.2, 1, 1, 1],
+        ServerMaxMoney: /*             */[1, 0.08, 0.04, 0.1125, 1, 0.2, 0.2, 1, 0.01, 1, 0.01, 1, 0.3375, 0.7],
+        ServerStartingMoney: /*        */[1, 0.4, 0.2, 0.75, 0.5, 0.5, 0.5, 1, 0.1, 1, 0.1, 1, 0.75, 0.5],
+        ServerStartingSecurity: /*     */[1, 1, 1, 1, 2, 1.5, 1.5, 1, 2.5, 1, 1, 1.5, 3, 1.5],
+        ServerWeakenRate: /*           */[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1],
+        StrengthLevelMultiplier: /*    */[1, 1, 1, 1, 1, 1, 1, 1, 0.45, 0.4, 1, 1, 0.7, 0.5],
+        StaneksGiftPowerMultiplier: /* */[1, 2, 0.75, 1.5, 1.3, 0.5, 0.9, 1, 0.5, 0.75, 1, 1, 2, 0.5],
+        StaneksGiftExtraSize: /*       */[0, -6, -2, 0, 0, 2, -1, -99, 2, -3, 0, 1, 1, -1],
+        WorldDaemonDifficulty: /*      */[1, 5, 2, 3, 1.5, 2, 2, 1, 2, 2, 1.5, 1, 3, 5]
+    }).map(([mult, values]) => [mult, values[bn - 1]]));
 }
 
 /** Returns the number of instances of the current script running on the specified host.
@@ -817,15 +847,18 @@ export function tail(ns, processId = undefined) {
     processId ??= ns.pid
     ns.tail(processId);
     // Don't move or resize tail windows that were previously opened and possibly moved by the player
-    if (tailedPids.has(processId))
+    const tailFile = '/Temp/helpers-tailed-pids.txt'; // Use a file so it can be wiped on reset
+    const fileContents = ns.read(tailFile);
+    const tailedPids = fileContents.length > 1 ? JSON.parse(fileContents) : [];
+    if (tailedPids.includes(processId))
         return //ns.tprint(`PID was previously moved ${processId}`);
     // By default, make all tail windows take up 75% of the width, 25% of the height available
     const [width, height] = ns.ui.windowSize();
-    ns.resizeTail(width * 0.75, height * 0.25, processId);
+    ns.resizeTail(width * 0.60, height * 0.25, processId);
     // Cascade windows: After each tail, shift the window slightly down and over so that they don't overlap
-    let offsetPct = ((((tailedPids.size % 30.0) / 30.0) + tailedPids.size) % 6.0) / 6.0;
+    let offsetPct = ((((tailedPids.length % 30.0) / 30.0) + tailedPids.length) % 6.0) / 6.0;
+    ns.print(width, ' ', height, ' ', processId, ' ', offsetPct, ' ', tailedPids)
     ns.moveTail(offsetPct * (width * 0.25 - 300) + 250, offsetPct * (height * 0.75 - 100) + 50, processId);
-    tailedPids.add(processId);
+    tailedPids.push(processId);
+    ns.write(tailFile, JSON.stringify(tailedPids), 'w');
 }
-// TODO: PIDs are reset on install, but this cache isn't, so this isn't a good long term solution
-const tailedPids = new Set([-1]); // The pids we previously configured a tail window for

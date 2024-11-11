@@ -1,12 +1,11 @@
 import {
     log, getConfiguration, getFilePath, waitForProcessToComplete,
-    runCommand, getNsDataThroughFile, getActiveSourceFiles, getErrorInfo, tail
+    runCommand, getNsDataThroughFile, formatMoney, getErrorInfo, tail
 } from './helpers.js'
 
 // Note to self: This script doesn't use ram-dodging in the inner loop, because we want to
 // delete all temp files and avoid creating more so that the game saves / reloads faster.
 
-const ran_flag = "/Temp/ran-casino.txt"
 const supportMsg = "Consider posting a full-game screenshot and your save file in the Discord channel or in a new github issue if you want help debugging this issue.";
 let doc = eval("document");
 let options;
@@ -40,6 +39,21 @@ export async function main(ns) {
         tail(ns)
     else
         ns.disableLog("ALL");
+
+    let abort = false;
+    /*// TODO:
+    // Let the user know what's going on and give them an easy way to kill casino.js
+    function showDialog(onCancel) {
+        const dlg = doc.createElement('div');
+        dlg.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);padding:20px;';
+        dlg.innerHTML = `<p>casino.js is running until it wins \$10b. It will reload the save if it loses too much.<br/>` +
+            `It should only take a minute or two, but you can cancel by clicking the button below.</p>` +
+            `<button>Cancel</button>`;
+        dlg.querySelector('button').onclick = () => { onCancel(); doc.body.removeChild(dlg); };
+        doc.body.appendChild(dlg);
+    }
+    showDialog(() => abort = true);
+    //*/
 
     /** Helper function to detect if focus was stolen by (e.g.) faction|company work|studying|training and send that work to the background
      * @param {boolean} throwError (default true) If true, and we were doing focus work, throws an Error.
@@ -112,7 +126,7 @@ export async function main(ns) {
     await checkForKickedOut(3);
 
     // Step 1: Find the button used to save the game. (Lots of retries because it can take a while after reloading the page)
-    const btnSaveGame = await findRequiredElement(ns, "//button[@aria-label = 'save game']", 15,
+    const btnSaveGame = await findRequiredElement(ns, "//button[@aria-label = 'save game']", 100,
         `Sorry, couldn't find the Overview Save (💾) button. Is your \"Overview\" panel collapsed or modded?`, true);
     async function saveGame() {
         if (saveSleepTime) await ns.sleep(saveSleepTime);
@@ -123,7 +137,7 @@ export async function main(ns) {
 
     // Note, we deliberately DO NOT pre-emptively check our active source files, or do any kind of RAM dodging
     // const unlockedSFs = await getActiveSourceFiles(ns, true); // See if we have SF4 to travel automatically
-    // Why? Because this creates "Temp files", and we want to keep the safe file as small as possible for fast saves and reloads.
+    // Why? Because this creates "Temp files", and we want to keep the save file as small as possible for fast saves and reloads.
     //      We use an empty temp folder as a sign that we previously ran and killed all scripts and can safely proceed.
 
     // Step 2: Try to navigate to the blackjack game (with retries in case of transient errors)
@@ -184,8 +198,13 @@ export async function main(ns) {
             btnStartGame = await findRequiredElement(ns, "//button[text() = 'Start']");
 
             // Step 2.6: Clean up temp files and kill other running scripts to speed up the reload cycle
-            if (ns.ls("home", "Temp/").length > 0) { // Do a little clean-up to speed up save/load.
+            if (ns.ls("home", "Temp/").length > 0) { // If there are some temp files, it suggests we haven't killed all scripts and cleaned up yet
                 // Step 2.6.1: Test that we aren't already kicked out of the casino before doing drastic things like killing scripts
+                const moneySources = await getNsDataThroughFile(ns, 'ns.getMoneySources()'); // NEW (2022): We can use money sources to see what our casino earnings have been
+                const priorCasinoEarnings = moneySources.sinceInstall.casino;
+                if (priorCasinoEarnings >= 1e10)
+                    log(ns, `INFO: We've previously earned ${formatMoney(priorCasinoEarnings)} from the casino, which should mean we've already been kicked out, ` +
+                        `but we can double-check anyway by attempting to play a game, since you bothered running this script, and I've bothered scripting the check :)`, true)
                 await setText(ns, inputWager, `1`); // Bet just a dollar and quick the game right away, no big deal
                 await click(ns, btnStartGame);
                 if (await tryfindElement(ns, "//p[contains(text(), 'Count:')]", 10)) { // If this works, we're still allowed in
@@ -225,8 +244,9 @@ export async function main(ns) {
 
     // Step 4: Play until we lose or are kicked out
     try {
-        let startGameRetries = 0;
+        let startGameRetries = 0, netWinnings = 0, peakWinnings = 0;
         while (true) {
+            if (abort) return;
             // Step 4.1: Bet the maximum amount (we save scum to avoid losing, so no risk of going broke)
             const bet = Math.min(1E8, ns.getPlayer().money * 0.9 /* Avoid timing issues with other scripts spending money */);
             if (bet < 0) return await reload(ns); // If somehow we have no money, we can't continue
@@ -326,15 +346,25 @@ export async function main(ns) {
                 case "tie": // Nothing gained or lost, we can immediately start a new game.
                     continue;
                 case "win": // We want to "lock in" our wins by saving the game after each one
-                    if (saveSleepTime) await ns.sleep(saveSleepTime);
-                    await click(ns, btnSaveGame); // Save if we won
-                    if (saveSleepTime) await ns.sleep(saveSleepTime);
+                    netWinnings += bet;
+                    // Keep tabs of our best winnings, and save the game each time we top it
+                    if (netWinnings > peakWinnings) {
+                        peakWinnings = netWinnings
+                        if (netWinnings > 0)
+                            if (saveSleepTime) await ns.sleep(saveSleepTime);
+                        await click(ns, btnSaveGame); // Save if we won
+                        if (saveSleepTime) await ns.sleep(saveSleepTime);
+                    }
                     // Quick pre-emptive test after each win to see if we've been kicked out
-                    if (await checkForKickedOut(5)) // Only 5 retries should be very fast
+                    if (await checkForKickedOut(1)) // Only 1 retry should be very fast
                         return await onCompletion(ns);
                     continue;
-                case "lose": // We want to reload the game (save scum) to undo our loss :)
-                    return await reload(ns);
+                case "lose":
+                    netWinnings -= bet;
+                    // To avoid reloading too often, only reload if we're losing really badly (almost broke, or down by 10 games)
+                    if (ns.getPlayer().money < 1E8 || netWinnings <= peakWinnings - 10 * 1E8)
+                        return await reload(ns); // We want to reload the game (save scum) to undo our loss :)
+                    continue;
                 default:
                     throw new Error(`winLoseTie was set to \"${(winLoseTie === undefined ? 'undefined' :
                         winLoseTie === null ? 'null' : winLoseTie)}\", which shouldn't be possible`);
@@ -417,11 +447,10 @@ async function killAllOtherScripts(ns, removeRemoteFiles) {
  *  @param {boolean} kickedOutAfterPlaying (default: true) set to false if we detected having been kicked out before we even started.
  *  Run when we can no longer gamble at the casino (presumably because we've been kicked out) **/
 async function onCompletion(ns, kickedOutAfterPlaying = true) {
-    ns.write(ran_flag, "True", "w"); // Write a file indicating we think we've been kicked out of the casino.
     if (kickedOutAfterPlaying)
         log(ns, "SUCCESS: We've been kicked out of the casino.", true);
     else
-        log(ns, "WARNING: We appear to have been previously kicked out of the casino. Continuing without playing...", true);
+        log(ns, "INFO: We appear to have been previously kicked out of the casino. Continuing without playing...", true);
 
     // For convenience, route to the terminal (but no stress if it doesn't work)
     try {
@@ -525,9 +554,12 @@ async function internalfindWithRetry(ns, xpath, expectFailure, maxRetries, custo
         if (expectFailure) {
             if (verbose)
                 log(ns, `INFO: Element doesn't appear to be present, moving on...`, false);
-        } else
-            throw new Error(customErrorMessage ?? `Could not find the element with xpath: \"${logSafeXPath}\"\n` +
-                `Something may have stolen focus or otherwise routed the UI away from the Casino.`, true, 'error');
+        } else {
+            const errMessage = customErrorMessage ?? `Could not find the element with xpath: \"${logSafeXPath}\"\n` +
+                `Something may have stolen focus or otherwise routed the UI away from the Casino.`;
+            log(ns, 'ERROR: ' + errMessage, true, 'error')
+            throw new Error(errMessage, true, 'error');
+        }
     } catch (e) {
         if (!expectFailure) throw e;
     }

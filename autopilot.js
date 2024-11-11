@@ -39,7 +39,6 @@ export function autocomplete(data, args) {
 
 const persistentLog = "log.autopilot.txt";
 const factionManagerOutputFile = "/Temp/affordable-augs.txt"; // Temp file produced by faction manager with status information
-const casinoFlagFile = "/Temp/ran-casino.txt";
 const defaultBnOrder = [ // The order in which we intend to play bitnodes
     // 1st Priority: Key new features and/or major stat boosts
     4.3,  // Normal. Need singularity to automate everything, and need the API costs reduced from 16x -> 4x -> 1x reliably do so from the start of each BN
@@ -76,23 +75,28 @@ const defaultBnOrder = [ // The order in which we intend to play bitnodes
     3.3,  // Hard.   Corporations. I have no corp scripts, maybe one day I will. The history here is: in 2021, corps were too exploity and broke the game (inf. money). Also the APIs were buggy and new, so I skipped it. Autopilot will win normally while ignoring corps.
     12.9999 // Easy. Keep playing forever. Only stanek scales very well here, there is much work to be done to be able to climb these faster.
 ];
+const augTRP = "The Red Pill";
+const augStanek = `Stanek's Gift - Genesis`;
 
 let playerInGang = false, rushGang = false; // Tells us whether we're should be trying to work towards getting into a gang
 let playerInBladeburner = false; // Whether we've joined bladeburner
-let wdHack = 0; // If the WD server is available (i.e. TRP is installed), caches the required hack level
+let wdHack = (/**@returns{null|number}*/() => null); // If the WD server is available (i.e. TRP is installed), caches the required hack level
 let ranCasino = false; // Flag to indicate whether we've stolen 10b from the casino yet
 let reservedPurchase = 0; // Flag to indicate whether we've reservedPurchase money and can still afford augmentations
-let alreadyJoinedDaedalus = false, autoJoinDaedalusUnavailable = false, reservingMoneyForDaedalus = false, prioritizeHackForDaedalus = false; // Flags to indicate that we should be keeping 100b cash on hand to earn an invite to Daedalus
+let alreadyJoinedDaedalus = false, autoJoinDaedalusUnavailable = false, reservingMoneyForDaedalus = false; // Flags to indicate that we should be keeping 100b cash on hand to earn an invite to Daedalus
+let prioritizeHackForDaedalus = false, prioritizeHackForWd = false;
 let lastScriptsCheck = 0; // Last time we got a listing of all running scripts
 let homeRam = 0; // Amount of RAM on the home server, last we checked
 let killScripts = []; // A list of scripts flagged to be restarted due to changes in priority
 let dictOwnedSourceFiles = [], unlockedSFs = [], nextBn = 0; // Info for the current bitnode
-let installedAugmentations = [], playerInstalledAugCount = 0, stanekLaunched = false; // Info for the current ascend
+let resetInfo = (/**@returns{ResetInfo}*/() => undefined)(); // Information about the current bitnode
+let bitNodeMults = (/**@returns{BitNodeMultipliers}*/() => undefined)(); // bitNode multipliers that can be automatically determined after SF-5
+let playerInstalledAugCount = (/**@returns{null|number}*/() => null); // Number of augs installed, or null if we don't have SF4 and can't tell.
+let installedAugmentations = [];
+let acceptedStanek = false, stanekLaunched = false;
 let daemonStartTime = 0; // The time we personally launched daemon.
 let installCountdown = 0; // Start of a countdown before we install augmentations.
 let bnCompletionSuppressed = false; // Flag if we've detected that we've won the BN, but are suppressing a restart
-let resetInfo = (/**@returns{ResetInfo}*/() => undefined)(); // Information about the current bitnode
-let bitNodeMults = (/**@returns{BitNodeMultipliers}*/() => undefined)(); // bitNode multipliers that can be automatically determined after SF-5
 
 // Replacements for player properties deprecated since 2.3.0
 function getTimeInAug() { return Date.now() - resetInfo.lastAugReset; }
@@ -134,8 +138,9 @@ async function startUp(ns) {
 
     // Reset global state
     playerInGang = rushGang = playerInBladeburner = ranCasino =
-        alreadyJoinedDaedalus = autoJoinDaedalusUnavailable = reservingMoneyForDaedalus = prioritizeHackForDaedalus =
-        bnCompletionSuppressed = stanekLaunched = false;
+        alreadyJoinedDaedalus = autoJoinDaedalusUnavailable = reservingMoneyForDaedalus =
+        prioritizeHackForDaedalus = prioritizeHackForWd =
+        bnCompletionSuppressed = acceptedStanek = stanekLaunched = false;
     playerInstalledAugCount = wdHack = null;
     installCountdown = daemonStartTime = lastScriptsCheck = homeRam = reservedPurchase = 0;
     lastStatusLog = "";
@@ -148,11 +153,15 @@ async function startUp(ns) {
     unlockedSFs = await getActiveSourceFiles(ns, true);
     homeRam = await getNsDataThroughFile(ns, `ns.getServerMaxRam(ns.args[0])`, null, ["home"]);
     try {
-        installedAugmentations = !(4 in unlockedSFs) ? [] :
-            await getNsDataThroughFile(ns, 'ns.singularity.getOwnedAugmentations()', '/Temp/player-augs-installed.txt');
-        if (!(4 in unlockedSFs))
+        if (!(4 in unlockedSFs)) {
             log(ns, `WARNING: This script requires SF4 (singularity) functions to assess purchasable augmentations ascend automatically. ` +
                 `Some functionality will be disabled and you'll have to manage working for factions, purchasing, and installing augmentations yourself.`, true);
+            installedAugmentations = [];
+            playerInstalledAugCount = null; // 'null' is treated as 'Unknown'
+        } else {
+            installedAugmentations = await getNsDataThroughFile(ns, 'ns.singularity.getOwnedAugmentations()', '/Temp/player-augs-installed.txt');
+            playerInstalledAugCount = installedAugmentations.length;
+        }
     } catch (err) {
         if (unlockedSFs[4] || 0 == 3) throw err; // No idea why this failed, treat as temporary and allow auto-retry.
         log(ns, `WARNING: You only have SF4 level ${unlockedSFs[4]}. Without level 3, some singularity functions will be ` +
@@ -203,11 +212,13 @@ async function initializeNewBitnode(ns) {
  * @param {NS} ns */
 async function mainLoop(ns) {
     const player = await getPlayerInfo(ns);
+    await updateCachedData(ns);
     let stocksValue = 0;
     try { stocksValue = await getStocksValue(ns); } catch { /* Assume if this fails (insufficient ram) we also have no stocks */ }
     manageReservedMoney(ns, player, stocksValue);
     await checkOnDaedalusStatus(ns, player, stocksValue);
     await checkIfBnIsComplete(ns, player);
+    await maybeAcceptStaneksGift(ns, player);
     await checkOnRunningScripts(ns, player);
     await maybeDoCasino(ns, player);
     await maybeInstallAugmentations(ns, player);
@@ -221,14 +232,30 @@ async function getPlayerInfo(ns) {
     return await getNsDataThroughFile(ns, `ns.getPlayer()`);
 }
 
+/** Update some information that can be safely cached for small periods of time
+ * @param {NS} ns */
+async function updateCachedData(ns) {
+    // Now that grafting is a thing, we need to check if new augmentations have been installed between resets
+    if ((4 in unlockedSFs)) { // Note: Installed augmentations can also be obtained from getResetInfo() (without SF4), but this seems unintended and will probably be removed from the game.
+        try {
+            installedAugmentations = await getNsDataThroughFile(ns, 'ns.singularity.getOwnedAugmentations()', '/Temp/player-augs-installed.txt');
+            playerInstalledAugCount = installedAugmentations.length;
+        } catch (err) {
+            log(ns, `WARNING: failed to update owned augmentations (low RAM?)`, true);
+        }
+    }
+}
+
 /** Logic run periodically to if there is anything we can do to speed along earning a Daedalus invite
  * @param {NS} ns
  * @param {Player} player **/
 async function checkOnDaedalusStatus(ns, player, stocksValue) {
     // Early exit conditions, if we Daedalus is not (or is no longer) a concern for this reset
     if (alreadyJoinedDaedalus || autoJoinDaedalusUnavailable) return;
-    // If we've already installed the red pill (w0r1d_d43m0n will have a non-zero hack) we no longer need this faction.
-    if ((wdHack || 0) > 0) return;
+    // If we've already installed the red pill we no longer need to try to join this faction.
+    // Even without SF4, we can "deduce" whether we've installed TRP by checking whether w0r1d_d43m0n has a non-zero hack level
+    if (installedAugmentations.includes(augTRP) || (wdHack != null && Number.isFinite(wdHack) && wdHack > 0))
+        return alreadyJoinedDaedalus = true; // Set up an early exit condition for future checks
     // See if we even have enough augmentations to attempt to join Daedalus (once we have a count of our augmentations)
     if (playerInstalledAugCount !== null && playerInstalledAugCount < bitNodeMults.DaedalusAugsRequirement)
         return autoJoinDaedalusUnavailable = true; // Won't be able to unlock daedalus this ascend
@@ -266,9 +293,9 @@ async function checkOnDaedalusStatus(ns, player, stocksValue) {
     if (player.skills.hacking < 2500) {
         // If we happen to already have enough money for daedalus and are only waiting on hack-level,
         // set a flag to switch daemon.js into --xp-only mode, to prioritize earning hack exp over money
-        // HEURISTIC (i.e. Hack): Only do this if we naturally get within 90% of the hack stat requirement,
+        // HEURISTIC (i.e. Hack): Only do this if we naturally get within 75% of the hack stat requirement,
         //    otherwise, assume our hack gain rate is too low in this reset to make it all the way to 2500.
-        if (totalWorth >= moneyReq && player.skills.hacking >= (2500 * 0.90))
+        if (totalWorth >= moneyReq && player.skills.hacking >= (2500 * 0.75))
             prioritizeHackForDaedalus = true;
         //log(ns, `total worth: ${formatMoney(totalWorth)} moneyReq: ${formatMoney(moneyReq)} prioritizeHackForDaedalus: ${prioritizeHackForDaedalus}`)
         return reservingMoneyForDaedalus = false; // Don't reserve money until hack level suffices
@@ -318,6 +345,12 @@ async function checkIfBnIsComplete(ns, player) {
         bnComplete = await getNsDataThroughFile(ns,
             `ns.bladeburner.getActionCountRemaining('blackop', 'Operation Daedalus') === 0`,
             '/Temp/bladeburner-completed.txt');
+
+    // HEURISTIC: If we naturally get within 75% of the if w0r1d_d43m0n hack stat requirement,
+    //    switch daemon.js to prioritize earning hack exp for the remainder of the BN
+    if (player.skills.hacking >= (wdHack * 0.75))
+        prioritizeHackForWd = !bnComplete;
+
     if (!bnComplete) return false; // No win conditions met
 
     const text = `BN ${resetInfo.currentNode}.${(dictOwnedSourceFiles[resetInfo.currentNode] || 0) + 1} completed at ` +
@@ -371,7 +404,9 @@ async function checkIfBnIsComplete(ns, player) {
     if (pid) await waitForProcessToComplete(ns, pid);
 
     // Use the new special singularity function to automate entering a new BN
-    pid = await runCommand(ns, `ns.singularity.destroyW0r1dD43m0n(ns.args[0], ns.args[1])`, null, [nextBn, ns.getScriptName()]);
+    pid = await runCommand(ns, `ns.singularity.destroyW0r1dD43m0n(ns.args[0], ns.args[1]` +
+        `, { sourceFileOverrides: new Map() }` + // Work around a long-standing bug on bitburner-official.github.io TODO: Remove
+        `)`, null, [nextBn, ns.getScriptName()]);
     if (pid) {
         log(ns, `SUCCESS: Initiated process ${pid} to execute 'singularity.destroyW0r1dD43m0n' with args: [${nextBn}, ${ns.getScriptName()}]`, true, 'success')
         await waitForProcessToComplete(ns, pid);
@@ -454,13 +489,15 @@ async function checkOnRunningScripts(ns, player) {
             const dictServerHackReqs = await getNsDataThroughFile(ns, 'Object.fromEntries(ns.args.map(server => [server, ns.getServerRequiredHackingLevel(server)]))',
                 '/Temp/servers-hack-req.txt', incomeByServer.map(s => s.hostname));
             const [bestServer, gain] = incomeByServer.filter(s => dictServerHackReqs[s.hostname] <= player.skills.hacking)
-                .reduce(([bestServer, bestIncome], target) => target.gainRate > bestIncome ? [target.hostname, target.gainRate] : [bestServer, bestIncome], [null, 0]);
-            if (bestServer) {
+                .reduce(([bestServer, bestIncome], target) => target.gainRate > bestIncome ? [target.hostname, target.gainRate] : [bestServer, bestIncome], [null, -1]);
+            if (bestServer && gain > 1) {
                 log(ns, `Identified that the best hack income server is ${bestServer} worth ${formatMoney(gain)}/sec.`)
                 launchScriptHelper(ns, 'spend-hacknet-hashes.js',
                     ["--liquidate", "--spend-on", "Increase_Maximum_Money", "--spend-on", "Reduce_Minimum_Security", "--spend-on-server", bestServer]);
-            } else
-                log(ns, `WARNING: strServerIncomeInfo was not empty, but could not determine best server:\n${strServerIncomeInfo}`)
+            } else if (gain <= 1)
+                log(ns, `INFO: Hack income is currently too severely penalized to merit launching spend-hacknet-hashes.js to boost servers.`);
+            else
+                log(ns, `WARNING: strServerIncomeInfo was not empty, but could not determine best server:\n${strServerIncomeInfo}`);
         }
     }
 
@@ -488,7 +525,7 @@ async function checkOnRunningScripts(ns, player) {
             daemonArgs.push("--no-share", "--initial-max-targets", 1);
         } else { // XP-ONLY MODE: We can shift daemon.js to this when we want to prioritize earning hack exp rather than money
             // Only do this if we aren't in --looping mode because TODO: currently it does not kill it's loops on shutdown, so they'd be stuck in hack exp mode
-            let useXpOnlyMode = prioritizeHackForDaedalus ||
+            let useXpOnlyMode = prioritizeHackForDaedalus || prioritizeHackForWd ||
                 // In BNs that give no money for hacking, always start daemon.js in this mode (except BN8, because TODO: --xp-only doesn't handle stock manipulation)
                 (bitNodeMults.ScriptHackMoney * bitNodeMults.ScriptHackMoneyGain == 0 && resetInfo.currentNode != 8);
             if (!useXpOnlyMode) { // Otherwise, respect the configured interval / duration
@@ -505,10 +542,11 @@ async function checkOnRunningScripts(ns, player) {
                 daemonArgs.push("--xp-only", "--silent-misfires", "--no-share");
                 // If daemon.js isn't already running in hack exp mode, prepare a message to communicate the change
                 if (!existingDaemon?.args.includes("--xp-only"))
-                    daemonRelaunchMessage = prioritizeHackForDaedalus ?
-                        `Hack Level is the only missing requirement for Daedalus, so we will run daemon.js in --xp-only mode to try and speed along the invite.` :
-                        bitNodeMults.ScriptHackMoney == 0 ? `The current BitNode does not give any money from hacking, so we will run daemon.js in --xp-only mode.` :
-                            `Relaunching daemon.js to focus on earning Hack Experience for ${options['xp-mode-duration-minutes']} minutes (--xp-mode-duration-minutes)`;
+                    daemonRelaunchMessage = prioritizeHackForWd ? `We're close to the required hack level destroy the BN.` :
+                        prioritizeHackForDaedalus ? `Hack Level is the only missing requirement for Daedalus, so we will run daemon.js in --xp-only mode to try and speed along the invite.` :
+                            (bitNodeMults.ScriptHackMoney * bitNodeMults.ScriptHackMoneyGain == 0) ?
+                                `The current BitNode does not give any money from hacking, so we will run daemon.js in --xp-only mode.` :
+                                `Relaunching daemon.js to focus on earning Hack Experience for ${options['xp-mode-duration-minutes']} minutes (--xp-mode-duration-minutes)`;
             }
         }
         // Prevent daemon from starting "work-for-faction.js" since we now manage that script
@@ -526,19 +564,22 @@ async function checkOnRunningScripts(ns, player) {
 
     // Once stanek's gift is accepted, launch it once per reset before we launch daemon (Note: stanek's gift is auto-purchased by faction-manager.js on your first install)
     let stanekRunning = (13 in unlockedSFs) && findScript('stanek.js') !== undefined;
-    if ((13 in unlockedSFs) && installedAugmentations.includes(`Stanek's Gift - Genesis`) && !stanekLaunched && !stanekRunning) {
+    if ((13 in unlockedSFs) && !stanekLaunched && !stanekRunning && installedAugmentations.includes(augStanek)) {
         stanekLaunched = true; // Once we've know we've launched stanek once, we never have to again this reset.
         const stanekArgs = ["--on-completion-script", getFilePath('daemon.js')]
         if (daemonArgs.length >= 0) stanekArgs.push("--on-completion-script-args", JSON.stringify(daemonArgs)); // Pass in all the args we wanted to run daemon.js with
         launchScriptHelper(ns, 'stanek.js', stanekArgs);
         stanekRunning = true;
     }
+    // If stanek is running, tell daemon to reserve all home RAM for it.
+    if (stanekRunning)
+        daemonArgs.push("--reserved-ram", 1E100);
 
-    // Launch (or re-launch) daemon if it is not already running with all our desired args - so long as stanek isn't charging
+    // Launch (or re-launch) daemon if it is not already running with all our desired args
     let launchDaemon = !existingDaemon || daemonArgs.some(arg => !existingDaemon.args.includes(arg)) ||
         // Special cases: We also must relaunch daemon if it is running with certain flags we wish to remove
         (["--xp-only"].some(arg => !daemonArgs.includes(arg) && existingDaemon.args.includes(arg)))
-    if (!stanekRunning && launchDaemon) {
+    if (launchDaemon) {
         if (existingDaemon) {
             daemonRelaunchMessage ??= `Relaunching daemon.js with new arguments since the current instance doesn't include all the args we want.`;
             log(ns, daemonRelaunchMessage);
@@ -564,7 +605,7 @@ async function checkOnRunningScripts(ns, player) {
     // If gangs are unlocked, micro-manage how 'work-for-factions.js' is running by killing off unwanted instances
     if (2 in unlockedSFs) {
         // Check if we've joined a gang yet. (Never have to check again once we know we're in one)
-        if (!playerInGang) playerInGang = await getNsDataThroughFile(ns, 'ns.gang.inGang()', null);
+        if (!playerInGang) playerInGang = await getNsDataThroughFile(ns, 'ns.gang.inGang()');
         rushGang = !options['disable-rush-gangs'] && !playerInGang;
         // Detect if a 'work-for-factions.js' instance is running with args that don't match our goal. We aren't too picky,
         // (so the player can run with custom args), but should have --crime-focus if (and only if) we're still working towards a gang.
@@ -588,34 +629,81 @@ async function checkOnRunningScripts(ns, player) {
     }
 }
 
+/** Get the source of the player's earnings by category.
+ * @param {NS} ns
+ * @returns {Promise<MoneySources>} */
+async function getPlayerMoneySources(ns) {
+    return await getNsDataThroughFile(ns, 'ns.getMoneySources()');
+}
+
+/** Accept Stanek's gift immediately at the start of the BN (as opposed to just before the first install)
+ * if it looks like it will scale well.
+ * @param {NS} ns
+ * @param {Player} player */
+async function maybeAcceptStaneksGift(ns, player) {
+    // Look for any reason not to accept stanek's gift (do the quickest checks first)
+    if (acceptedStanek) return;
+    // Don't get Stanek's gift too early if its size is reduced in this BN
+    if (bitNodeMults.StaneksGiftExtraSize < 0) return;
+    // If Stanek's gift size isn't reduced, but is penalized, don't get it too early 
+    if (bitNodeMults.StaneksGiftExtraSize == 0 && bitNodeMults.StaneksGiftPowerMultiplier < 1) return;
+    // Otherwise, it is not penalized in any way, it's probably safe to get it immediately despite the 10% penalty to all stats
+    // If we won't have access to Stanek yet, skip this
+    if (!(13 in unlockedSFs)) return;
+    // If we've already accepted Stanek's gift (Genesis aug is installed), skip
+    if (installedAugmentations.includes(augStanek)) return acceptedStanek = true;
+    // If we have more than Neuroflux (aug) installed, we won't be allowed to accept the gift (but we can try)
+    if (installedAugmentations.length > 1)
+        log(ns, `WARNING: We think it's a good idea to accept Stanek's Gift, but it appears to be too late - other augmentations have been installed. Trying Anyway...`);
+    // Use the API to accept Stanek's gift
+    if (await getNsDataThroughFile(ns, 'ns.stanek.acceptGift()')) {
+        log(ns, `SUCCESS: Accepted Stanek's Gift!`, true, 'success');
+        installedAugmentations.push(augStanek); // Manually add Genesis to installed augmentations so checkOnRunningScripts picks up on the change.
+    } else
+        log(ns, `WARNING: autopilot.js tried to accepted Stanek's Gift, but was denied.`, true, 'warning');
+    // Whether we succeded or failed, don't try again - if we're denied entry (due to having an augmentation) we will never be allowed in
+    acceptedStanek = true;
+}
+
 /** Logic to steal 10b from the casino
  * @param {NS} ns
  * @param {Player} player */
 async function maybeDoCasino(ns, player) {
     if (ranCasino || options['disable-casino']) return;
-    const casinoRanFileSet = ns.read(casinoFlagFile);
-    const cashRootBought = installedAugmentations.includes(`CashRoot Starter Kit`);
-    // If the casino flag file is already set in first 10 minutes of the reset, and we don't have anywhere near the 10B it should give,
-    // it's likely a sign that the flag is wrong and we should run cleanup and let casino get run again to be safe.
-    if (getTimeInAug() < 10 * 60 * 1000 && casinoRanFileSet && player.money + (await getStocksValue(ns)) < 8E9) {
-        const pid = launchScriptHelper(ns, 'cleanup.js');
-        if (pid) await waitForProcessToComplete(ns, pid);
-    } else if (casinoRanFileSet)
+    // Figure out whether we've already been kicked out of the casino for earning more than 10b there
+    const moneySources = await getPlayerMoneySources(ns);
+    const casinoEarnings = moneySources.sinceInstall.casino;
+    if (casinoEarnings >= 1e10) {
+        log(ns, `INFO: Skipping running casino.js, as we've previously earned ${formatMoney(casinoEarnings)} and been kicked out.`);
         return ranCasino = true;
-    // If it's been less than 1 minute, wait a while to establish income (unless in BN8)
-    // The exception is if we are in BN8 and have CashRoot Starter Kit. In this case we can head straight to the casino.
-    if (resetInfo.currentNode != 8 && getTimeInAug() < 60000)
-        return;
-    // If we're making more than ~5b / minute, no need to run casino. (Unless BN8, if BN8 we always need casino cash bootstrap)
-    // Since it's possible that the CashRoot Startker Kit could give a false income velocity, account for that.
-    if (resetInfo.currentNode != 8 && (cashRootBought ? player.money - 1e6 : player.money) / getTimeInAug() > 5e9 / 60000)
+    }
+    // If we already have more than 1t money but hadn't run casino.js yet, don't bother. Another 10b won't move the needle much.
+    const playerWealth = player.money + (await getStocksValue(ns));
+    if (playerWealth >= 1e12) {
+        log(ns, `INFO: Skipping running casino.js, since we're already ridiculously wealthy (${formatMoney(playerWealth)} > 1t).`);
         return ranCasino = true;
-    if (player.money > 10E9) // If we already have 10b, assume we ran and lost track, or just don't need the money
-        return ranCasino = true;
-    if (player.money < 250000)
-        return; // We need at least 200K (and change) to run casino so we can travel to aevum
+    }
 
-    // Run casino.js (and expect ourself to get killed in the process)
+    // If we're making more than ~5b / minute from the start of the BN, there's no need to run casino.
+    // In BN8 this is impossible, so in that case we don't even check and head straight to the casino.
+    if (resetInfo.currentNode != 8) {
+        // If we've been in the BN for less than 1 minute, wait a while to establish player's income rate 
+        if (getTimeInAug() < 60000)
+            return;
+        // Since it's possible that the CashRoot Startker Kit could give a false income velocity, account for that.
+        const cashRootBought = installedAugmentations.includes(`CashRoot Starter Kit`);
+        const incomePerMinute = (playerWealth - (cashRootBought ? 1e6 : 0)) / getTimeInAug();
+        if (incomePerMinute > 5e9 / 60000) {
+            log(ns, `INFO: Skipping running casino.js this augmentation, since our income (${formatMoney(incomePerMinute)}/min) >= 5b/min`);
+            return ranCasino = true;
+        }
+    }
+
+    // If we aren't in Aevum already, wait until we have the 200K required to travel (plus some extra buffer to actually spend at the casino)
+    if (player.city != "Aevum" && player.money < 250000)
+        return;
+
+    // Run casino.js (and expect this script to get killed in the process)
     // Make sure "work-for-factions.js" is dead first, lest it steal focus and break the casino script before it has a chance to kill all scripts.
     await killScript(ns, 'work-for-factions.js');
     // Kill any action, in case we are studying or working out, as it might steal focus or funds before we can bet it at the casino.
@@ -626,10 +714,8 @@ async function maybeDoCasino(ns, player) {
     if (pid) {
         await waitForProcessToComplete(ns, pid);
         await ns.sleep(1000); // Give time for this script to be killed if the game is being restarted by casino.js
-        // If we didn't get killed, see if casino.js discovered it was already previously kicked out
-        if (ns.read(casinoFlagFile)) return ranCasino = true;
         // Otherwise, something went wrong
-        log(ns, `ERROR: Something went wrong. Casino.js ran, but we haven't been killed, and the casino flag file "${casinoFlagFile}" isn't set.`)
+        log(ns, `ERROR: Something went wrong. casino.js was run, but we haven't been killed. It must have run into a problem...`)
     }
 }
 
@@ -700,7 +786,15 @@ async function maybeInstallAugmentations(ns, player) {
         if (totalCost == 0) totalCost = 1; // Hack, logic below expects some non-zero reserve in preparation for ascending.
     }
 
-    // TODO: If we are in BN8, we get a big cash influx on each reset and it may be worth doing an immediate install or 2 to purchse upgrades, then get more free cash.
+    // Heuristic: if we can afford 4 or more augs in the first ~20 minutes, it's usually worth doing a "quick install"
+    // For example, in BN8, we get a big cash influx on each reset and can buy reputation immediately, so it's worth
+    //     doing an few immediate installs to purchse upgrades, then reset for more free cash.
+    if ((getTimeInAug() < 20 * 60 * 1000 && pendingAugInclNfCount >= 4) || (resetInfo.currentNode == 8 && getTimeInBitnode() < 10 * 60 * 1000)) {
+        shouldReset = true;
+        resetStatus = `We haven't been in this reset for long. We can do a quick reset immediately for a quick stat boost.\n${resetStatus}`;
+        if (options['install-countdown'] > 30 * 1000)
+            options['install-countdown'] = 30 * 1000; // Install relatively quickly in this scenario (30s)
+    }
 
     // If not ready to reset, set a status with our progress and return
     if (!shouldReset) {
@@ -780,11 +874,11 @@ async function shouldDelayInstall(ns, player, facmanOutput) {
             return true;
         }
     }
-    // In BN8, money is hard to come by, so if we're in Daedalus, but can't access TRP rep yet, wait until we have
-    // enough rep, or enough money to donate for rep to buy TRP (Reminder: donations always unlocked in BN8)
-    if (resetInfo.currentNode == 8 && player.factions.includes("Daedalus") && (wdHack || 0) == 0) {
-        if (!facmanOutput.affordable_augs.includes("The Red Pill") && !facmanOutput.awaiting_install_augs.includes("The Red Pill")) {
-            setStatus(ns, `Not installing until we have enough Daedalus rep to install TRP on our next reset.`)
+    // In BN8, large sums of money are hard to accumulate, so if we've made it into Daedalus, but can't access TRP rep yet,
+    // remain in the BN until we have enough rep and/or money to buy TRP (Reminder: in BN8, donations are immediately unlocked for all factions)    
+    if (resetInfo.currentNode == 8 && player.factions.includes("Daedalus") && !installedAugmentations.includes(augTRP)) {
+        if (!facmanOutput.affordable_augs.includes(augTRP) && !facmanOutput.awaiting_install_augs.includes(augTRP)) {
+            setStatus(ns, `Not installing until we have enough Daedalus rep to install "${augTRP}" on our next reset.`)
             return true;
         }
     }
